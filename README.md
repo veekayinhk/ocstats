@@ -50,20 +50,32 @@ base rates. `weekly` labels are Monday-of-week dates.
 
 ## Install
 
-Requirements: Python 3.9+ (the reference CLI has zero dependencies).
-The Bash variant additionally needs `sqlite3` (with JSON1), `jq` and `awk`.
-
 ```sh
-git clone https://github.com/YOUR_GH_USER/ocstats.git
-cd ocstats
-make install          # symlinks ocstats + ocstats.sh into ~/.local/bin
-ocstats               # done
+curl -fsSL https://raw.githubusercontent.com/veekayinhk/ocstats/main/install.sh | bash
 ```
 
-Optional compiled build (needs Go ≥1.22; downloads the driver once):
+That's it — installs the single-file Python CLI into `~/.local/bin`
+(no dependencies, no sudo). Pin a release or add the Bash variant:
 
 ```sh
-make build            # → ocstats-bin
+curl -fsSL .../install.sh | bash -s -- --ref v1.1.0 --with-bash
+```
+
+### Other ways to install
+
+**Compiled binary** (Go ≥1.22 — installs as `ocstats-go`, so move or alias it):
+
+```sh
+go install github.com/veekayinhk/ocstats/ocstats-go@latest
+mv "$(go env GOPATH)/bin/ocstats-go" "$(go env GOPATH)/bin/ocstats"
+```
+
+**From source** (adds `ocstats.sh`, tests, and the full repo):
+
+```sh
+git clone https://github.com/veekayinhk/ocstats.git
+cd ocstats
+make install          # symlinks ocstats + ocstats.sh into ~/.local/bin
 ```
 
 ## Commands
@@ -223,15 +235,11 @@ absolute specs (`2026-09`, `2026-09-01`) are calendar ranges. `--since` /
 
 ## Testing
 
-```sh
-make test
-```
-
-The suite generates a deterministic synthetic fixture database on first run
-(`tests/make_fixture.py`), then cross-checks the Python and Bash
-implementations: headline totals, matrix invariants, CSV/JSON/markdown shape,
-pivot reconciliation, prompt counts vs raw SQL, budget and comparison
-windows. The Go binary is exercised automatically once built.
+`make test` generates a deterministic synthetic fixture database (no real
+data) and cross-checks the Python and Bash implementations: headline totals,
+matrix invariants, output formats, prompt counts, budget and comparison
+windows. See [CONTRIBUTING.md](CONTRIBUTING.md) for details — and the one
+rule: a feature isn't done until all three implementations agree.
 
 ## Contributing
 

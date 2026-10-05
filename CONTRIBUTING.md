@@ -5,7 +5,7 @@ Thanks for considering a contribution! 🎉
 ## Setup
 
 ```sh
-git clone https://github.com/YOUR_GH_USER/ocstats.git
+git clone https://github.com/veekayinhk/ocstats.git
 cd ocstats
 make install       # symlink the CLIs into ~/.local/bin
 make test          # generates a synthetic fixture DB on first run

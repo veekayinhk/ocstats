@@ -1,4 +1,4 @@
-module ocstats
+module github.com/veekayinhk/ocstats/ocstats-go
 
 go 1.22
 

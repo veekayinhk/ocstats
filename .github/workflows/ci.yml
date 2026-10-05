@@ -45,6 +45,15 @@ jobs:
           done
           ./ocstats models --json | jq -e '.rows | type == "array"' > /dev/null
 
+      - name: Smoke test installer
+        run: |
+          bash -n install.sh
+          PREFIX="$RUNNER_TEMP/ocstats-bin-dir" ./install.sh --ref main
+          "$RUNNER_TEMP/ocstats-bin-dir/ocstats" --version
+          PREFIX="$RUNNER_TEMP/ocstats-bin-dir" ./install.sh --with-bash --ref main --bin-dir "$RUNNER_TEMP/ocstats-bin-dir"
+          "$RUNNER_TEMP/ocstats-bin-dir/ocstats.sh" --help > /dev/null
+          echo "installer smoke test OK"
+
   go-build:
     name: Build Go implementation
     runs-on: ubuntu-latest
