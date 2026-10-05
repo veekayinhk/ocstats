@@ -59,5 +59,7 @@ jobs:
       - name: Smoke test
         run: |
           python3 tests/make_fixture.py tests/fixture.db
-          ./ocstats-bin summary --json | jq -e '.totals' > /dev/null
-          ./ocstats-bin models --csv | head -2
+          OCSTATS_DB=tests/fixture.db ./ocstats-bin summary --json | jq -e '.totals.messages >= 0' > /dev/null
+          OCSTATS_DB=tests/fixture.db ./ocstats-bin models --csv > /dev/null
+          OCSTATS_DB=tests/fixture.db ./ocstats-bin pivot --rows project --cols day > /dev/null
+          echo "go smoke test OK"
