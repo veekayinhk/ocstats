@@ -269,7 +269,7 @@ func fetchRows(db *sql.DB, flt *Filters) ([]Row, error) {
 		r := Row{
 			TS:        t,
 			Day:       t.Format("2006-01-02"),
-			Week:      t.AddDate(0, 0, -int(t.Weekday())).Format("2006-01-02"),
+			Week:      mondayStart(t).Format("2006-01-02"),
 			Month:     t.Format("2006-01"),
 			Provider:  d.Model.ProviderID,
 			Model:     d.Model.ID,
@@ -657,12 +657,16 @@ func groupRows(rows []Row, dims []string, p *pricing, prompts []Prompt) []*Group
 	return order
 }
 
+func mondayStart(t time.Time) time.Time {
+	return t.AddDate(0, 0, -((int(t.Weekday())+6)%7))
+}
+
 func timeDim(t time.Time, dim string) string {
 	switch dim {
 	case "day":
 		return t.Format("2006-01-02")
 	case "week":
-		return t.AddDate(0, 0, -int(t.Weekday())).Format("2006-01-02")
+		return mondayStart(t).Format("2006-01-02")
 	case "month":
 		return t.Format("2006-01")
 	}

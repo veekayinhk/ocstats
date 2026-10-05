@@ -55,6 +55,10 @@ trap 'rm -f "$tmp"' EXIT
 
 say "downloading ocstats ($REF) → $BIN_DIR/ocstats"
 fetch "$REPO_RAW/$REF/ocstats" "$tmp"
+if [[ -n "${OCSTATS_SHA256:-}" ]]; then
+    echo "$OCSTATS_SHA256  $tmp" | sha256sum -c --quiet >/dev/null 2>&1 \
+        || fail "checksum mismatch — expected OCSTATS_SHA256=$OCSTATS_SHA256"
+fi
 chmod +x "$tmp"
 head -1 "$tmp" | grep -q '#!' || fail "downloaded file is not the CLI (bad ref? try --ref main)"
 mv -f "$tmp" "$BIN_DIR/ocstats"

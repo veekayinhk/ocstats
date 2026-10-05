@@ -98,16 +98,22 @@ done
 
 # --- new output modes & features ---------------------------------------------
 echo "output modes & analytics features:"
+# summary --json exposes the same top-level fields in both implementations
+py_keys=$("$PY" summary --json --since "$SINCE" | jq -r '.totals | keys[]' | sort)
+sh_keys=$("$SH" summary --json --since "$SINCE" 2>/dev/null | jq -r '.totals | keys[]' | sort)
+[[ "$py_keys" == "$sh_keys" ]] && ok "summary --json field parity (python == bash)" \
+                              || bad "summary json keys differ"
 # csv parses and rows match json count (csv always emits all rows)
 n_json=$("$PY" models --json --since "$SINCE" --limit 0 | jq '.rows | length')
 n_csv=$("$PY" models --csv --since "$SINCE" --limit 0 | tail -n +2 | grep -c .)
 [[ "$n_json" == "$n_csv" ]] && ok "python --csv rows ($n_csv) == --json rows" \
                         || bad "csv rows $n_csv != json rows $n_json"
 
-timeout 90 "$SH" models --csv --since "$SINCE" --limit 3 >/tmp/.ocstats_csv.$$ 2>&1 \
-    && grep -q "prompts" /tmp/.ocstats_csv.$$ \
+csv_tmp=$(mktemp)
+timeout 90 "$SH" models --csv --since "$SINCE" --limit 3 >"$csv_tmp" 2>&1 \
+    && grep -q "prompts" "$csv_tmp" \
     && ok "bash --csv includes prompts column" || bad "bash --csv missing prompts"
-rm -f /tmp/.ocstats_csv.$$
+rm -f "$csv_tmp"
 
 # markdown shape: header + alignment row + TOTAL
 mdout=$("$PY" providers --md --limit 3)
@@ -117,10 +123,11 @@ echo "$mdout" | grep -q '^| ' && echo "$mdout" | grep -q '\*\*TOTAL\*\*' \
 # details columns present
 "$PY" models --details --limit 1 --width 300 --no-color | grep -q "Last seen" \
     && ok "python --details shows extended stats" || bad "python --details missing columns"
-timeout 90 "$SH" models --details --limit 1 --no-color >/tmp/.ocstats_det.$$ 2>&1 \
-    && grep -q "Last seen" /tmp/.ocstats_det.$$ \
+det_tmp=$(mktemp)
+timeout 90 "$SH" models --details --limit 1 --no-color >"$det_tmp" 2>&1 \
+    && grep -q "Last seen" "$det_tmp" \
     && ok "bash --details shows extended stats" || bad "bash --details missing columns"
-rm -f /tmp/.ocstats_det.$$
+rm -f "$det_tmp"
 
 # top/bottom sanity: same command, different slices (first data row after the header border)
 top1=$("$PY" providers --top 1 --no-color | awk '/^├/{getline; print; exit}' | sed 's/^│ *//; s/ *│.*//')
@@ -156,10 +163,11 @@ plain_eff=$("$PY" providers --since 7d --json --limit 0 | jq '[.rows[].cost_eff]
 # budget block appears
 "$PY" summary --monthly-budget 50 --no-color --since "$SINCE" | grep -q "Pace" \
     && ok "python budget block renders" || bad "python budget missing"
-timeout 90 "$SH" summary --monthly-budget 50 --no-color --since "$SINCE" >/tmp/.ocstats_bud.$$ 2>&1 \
-    && grep -q "Pace" /tmp/.ocstats_bud.$$ \
+bud_tmp=$(mktemp)
+timeout 90 "$SH" summary --monthly-budget 50 --no-color --since "$SINCE" >"$bud_tmp" 2>&1 \
+    && grep -q "Pace" "$bud_tmp" \
     && ok "bash budget block renders" || bad "bash budget missing"
-rm -f /tmp/.ocstats_bud.$$
+rm -f "$bud_tmp"
 
 # --- go binary (only when built) ---------------------------------------------
 if [[ -x "$GO_BIN" ]]; then

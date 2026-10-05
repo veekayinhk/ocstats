@@ -805,7 +805,7 @@ def cmd_summary(rows, flt, pricing, args):
             "meta": meta_json(flt, pricing),
             "totals": {
                 "prompts": n_prompts,
-                "messages": len(rows), "sessions": len(sessions), "days": len(days),
+                "messages": len(rows), "sessions": len(sessions), "active_days": len(days),
                 "tokens": {"input": t_in, "output": t_out, "reasoning": t_reason,
                            "cache_read": t_cr, "cache_write": t_cw,
                            "total": sum(toks)},
@@ -835,7 +835,7 @@ def cmd_summary(rows, flt, pricing, args):
 
     if args.csv:
         w = csv.writer(sys.stdout, lineterminator="\n")
-        w.writerow(["prompts", "messages", "sessions", "days", "input", "output",
+        w.writerow(["prompts", "messages", "sessions", "active_days", "input", "output",
                     "reasoning", "cache_read", "cache_write", "tokens_total",
                     "cost_reported", "cost_estimated", "cost_effective"])
         w.writerow([n_prompts, len(rows), len(sessions), len(days), t_in, t_out,

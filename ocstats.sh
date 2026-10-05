@@ -577,6 +577,11 @@ group_report() { # group_report <title> <dims csv> [lo hi]
     esac
     ((BOTTOMN > 0)) && raw=$(tac <<<"$raw")
 
+    # share denominator over ALL groups (before min-share / limit slicing),
+    # matching the python implementation
+    local total_eff
+    total_eff=$(awk -F'\t' -v c="$e" '{s+=$c} END{printf "%.6f", s+0}' <<<"$raw")
+
     # --min-share: hide rows below P% of total effective cost
     local hidden=0
     if (( $(awk -v a="$MINSHARE" 'BEGIN{print (a > 0)}') )); then
@@ -600,8 +605,6 @@ group_report() { # group_report <title> <dims csv> [lo hi]
     if ((CSV));  then csv_group "$dims_csv" "$raw"; return; fi
 
     print_pricing_hint
-    local total_eff
-    total_eff=$(awk -F'\t' -v c="$e" '{s+=$c} END{printf "%.6f", s+0}' <<<"$raw")
 
     # --compare: join previous-window groups for delta columns
     local prev_map_file=""
@@ -679,13 +682,11 @@ group_report() { # group_report <title> <dims csv> [lo hi]
                 }
                 print line
             }' <<<"$limited"
-        if ((restn + hidden > 0)); then
-            local label="+ $((restn + hidden)) more"
+        if ((restn > 0)); then
             local pvextra=0
             [[ -n "$prev_map_file" ]] && pvextra=3
             local padcols=$(( 9 + ndim - 1 + DETAILS * 8 + pvextra ))
-            ((hidden > 0)) && label+=" ($hidden below ${MINSHARE}% share)"
-            printf '%s' "${DIM}${label}"
+            printf '%s' "${DIM}+ $restn more"
             printf '%s' "$(printf '\t%.0s' $(seq 1 "$padcols"))"
             printf '%s\n' "$RESET"
         fi
@@ -702,7 +703,8 @@ group_report() { # group_report <title> <dims csv> [lo hi]
                       B G money($(nd+10)) R "\t" B W money($(nd+11)) R "\t" B "100%" R
             }' <<<"$total"
     } | render_tsv "$title" "$aligns" 1 \
-       "Σ = reported where > 0, else estimated · — = no pricing data available"
+       "$(printf 'Σ = reported where > 0, else estimated · — = no pricing data available%s' \
+          "$([[ $hidden -gt 0 ]] && printf ' · %d group(s) below %s%% share hidden' "$hidden" "$MINSHARE")")"
     [[ -n "$prev_map_file" ]] && rm -f "$prev_map_file"
     echo
 }
@@ -760,6 +762,15 @@ cmd_summary() {
 
     if ((JSON)); then
         local jq_extra="" comp_json=""
+        local cr_pct_tok mean med p90 days_lo days_hi
+        cr_pct_tok=$(awk -v cr="$tcr" -v i="$tin" -v w="$tcw" 'BEGIN{ if (cr+i+w > 0) printf "%.6f", cr/(cr+i+w); else print "0" }')
+        days=$(awk '/^##TOTAL$/{exit} {n++} END{print n+0}' <<<"$day_raw")
+        days_lo=$(sort -t$'\t' -k1,1 <<<"$day_raw" | awk -F'\t' '!/^##/ && $1 != ""{print $1; exit}')
+        days_hi=$(awk -F'\t' '!/^##/ && $1 != ""{if ($1 > d) d=$1} END{print d}' <<<"$day_raw")
+        mean=$(awk -F'\t' '{printf "%.6f", $14}' <<<"$total")
+        med=$(awk  -F'\t' '{printf "%.6f", $15}' <<<"$total")
+        p90=$(awk  -F'\t' '{printf "%.6f", $16}' <<<"$total")
+        local total_tok=$((tin + tout + treas + tcr + tcw))
         if [[ -n "$MONTHLY_BUDGET" ]]; then
             local mtd
             mtd=$(awk -F'\t' -v m="$(date +%Y-%m)" '$1 == m {print $11; exit}' \
@@ -771,9 +782,10 @@ cmd_summary() {
             projected=$(awk -v m="$mtd" -v e="$dom" -v x="$dim" 'BEGIN{printf "%.6f", (e>0 ? m/e*x : 0)}')
             jq_extra=", \"budget\": {\"budget\": $MONTHLY_BUDGET, \"spent_mtd\": $mtd, \"projected_month_end\": $projected, \"remaining\": $(awk -v b="$MONTHLY_BUDGET" -v m="$mtd" 'BEGIN{printf "%.6f", b-m}'), \"used_pct\": $(awk -v b="$MONTHLY_BUDGET" -v m="$mtd" 'BEGIN{printf "%.4f", (b>0? m/b*100:0)}'), \"on_pace\": $(awk -v p="$projected" -v b="$MONTHLY_BUDGET" 'BEGIN{print (p<=b)?"true":"false"}')}"
         fi
-        printf '{"totals": {"prompts": %s, "messages": %s, "sessions": %s, "tokens": {"input": %s, "output": %s, "reasoning": %s, "cache_read": %s, "cache_write": %s, "total": %s}, "cost": {"reported": %s, "estimated": %s, "effective": %s}%s}}\n' \
-            "$prompts" "$n" "$sess" "$tin" "$tout" "$treas" "$tcr" "$tcw" "$(awk -v a="$tin" -v b="$tout" -v c="$treas" -v d="$tcr" -v e="$tcw" 'BEGIN{printf "%d", a+b+c+d+e}')" \
-            "$rep" "$est" "$eff" "$jq_extra" | jq .
+        printf '{"totals": {"prompts": %s, "messages": %s, "sessions": %s, "active_days": %s, "tokens": {"input": %s, "output": %s, "reasoning": %s, "cache_read": %s, "cache_write": %s, "total": %s}, "cache_ratio": %s, "tokens_per_message": {"mean": %s, "median": %s, "p90": %s}, "cost": {"reported": %s, "estimated": %s, "effective": %s}, "period": {"from": "%s", "to": "%s"}%s}}\n' \
+            "$prompts" "$n" "$sess" "$days" "$tin" "$tout" "$treas" "$tcr" "$tcw" "$total_tok" \
+            "$cr_pct_tok" "$mean" "$med" "$p90" \
+            "$rep" "$est" "$eff" "$days_lo" "$days_hi" "$jq_extra" | jq .
         return
     fi
     if ((CSV)); then
@@ -949,16 +961,8 @@ cmd_pivot() {
     [[ -z "$raw" ]] && { echo "$PROG: no messages matched the current filters" >&2; exit 1; }
     # raw nd=2: rowval(1) colval(2) n prompts sess in out reason cr cw rep est eff ... toktot(19)
 
-    local col_keys row_keys grand mx
-    col_keys=$(awk -F'\t' '{ print $2 }' <<<"$raw" | sort -u)
-    row_keys=$(awk -F'\t' -v c="$((mcol + 2))" '{ tot[$1] += $c }
-               END { for (k in tot) printf "%s\t%.6f\n", k, tot[k] }' <<<"$raw" \
-               | sort -t$'\t' -k2,2gr | cut -f1)
+    local grand
     grand=$(awk -F'\t' -v c="$((mcol + 2))" '{ s += $c } END { printf "%.6f", s + 0 }' <<<"$raw")
-    mx=$(awk -F'\t' -v c="$((mcol + 2))" '{ if ($c+0 > m) m = $c+0 } END { printf "%.6f", m + 0 }' <<<"$raw")
-
-    local vfmt="tok"
-    [[ "$metric" == "cost" ]] && vfmt="money"
 
     if ((JSON)); then
         awk -F'\t' -v rd="$rowdim" -v cd="$eff_coldim" -v c="$((mcol + 2))" -v g="$grand" '

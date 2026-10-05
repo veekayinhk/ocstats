@@ -71,4 +71,10 @@ jobs:
           OCSTATS_DB=tests/fixture.db ./ocstats-bin summary --json | jq -e '.totals.messages >= 0' > /dev/null
           OCSTATS_DB=tests/fixture.db ./ocstats-bin models --csv > /dev/null
           OCSTATS_DB=tests/fixture.db ./ocstats-bin pivot --rows project --cols day > /dev/null
+          # weekly buckets must start on Monday (parity with python/bash)
+          OCSTATS_DB=tests/fixture.db ./ocstats-bin weekly --csv | tail -n +2 | cut -d, -f1 \
+            | while read -r w; do
+                [ -z "$w" ] && continue
+                [ "$(date -d "$w" +%u)" = "1" ] || { echo "non-Monday week label: $w"; exit 1; }
+              done
           echo "go smoke test OK"
