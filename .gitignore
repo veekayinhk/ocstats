@@ -1,0 +1,11 @@
+# Local artifacts
+ocstats-bin
+__pycache__/
+*.pyc
+
+# generated test fixture (regenerate with: python3 tests/make_fixture.py)
+tests/fixture.db
+
+# scratch
+*.tmp
+.DS_Store

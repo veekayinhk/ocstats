@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Cross-implementation test suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system tools
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 jq
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Syntax checks
+        run: |
+          python3 -m py_compile ocstats tests/make_fixture.py
+          bash -n ocstats.sh tests/compare.sh
+
+      - name: Run cross-implementation test suite (synthetic fixture)
+        run: ./tests/compare.sh
+
+      - name: Smoke test all commands on fixture
+        run: |
+          export OCSTATS_DB=tests/fixture.db
+          python3 tests/make_fixture.py tests/fixture.db
+          set -e
+          for cmd in "summary" "models" "providers" "agents" "projects" \
+                     "sessions" "daily" "weekly" "monthly" "prices" \
+                     "matrix --by provider,month" \
+                     "pivot --rows project --cols day" \
+                     "models --details --csv" "providers --md" \
+                     "providers --top 2" "providers --bottom 2" \
+                     "providers --min-share 1" "summary --monthly-budget 50" \
+                     "providers --compare 7d/7d"; do
+            ./ocstats --no-color $cmd > /dev/null
+            ./ocstats.sh --no-color $cmd > /dev/null
+          done
+          ./ocstats models --json | jq -e '.rows | type == "array"' > /dev/null
+
+  go-build:
+    name: Build Go implementation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: Build
+        working-directory: ocstats-go
+        run: go mod tidy && go build -o ../ocstats-bin .
+      - name: Smoke test
+        run: |
+          python3 tests/make_fixture.py tests/fixture.db
+          ./ocstats-bin summary --json | jq -e '.totals' > /dev/null
+          ./ocstats-bin models --csv | head -2
