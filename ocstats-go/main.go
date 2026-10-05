@@ -522,10 +522,10 @@ ORDER BY sm.time_created`
 		if err := rows.Scan(&sid, &ts, &dir); err != nil {
 			return nil, err
 		}
-		if flt.session != "" && !strings.HasPrefix(sid, flt.session) {
+		if flt.Session != "" && !strings.HasPrefix(sid, flt.Session) {
 			continue
 		}
-		if flt.project != "" && !strings.Contains(strings.ToLower(dir), strings.ToLower(flt.project)) {
+		if flt.Project != "" && !strings.Contains(strings.ToLower(dir), strings.ToLower(flt.Project)) {
 			continue
 		}
 		out = append(out, Prompt{TS: time.UnixMilli(ts), Session: sid})
@@ -691,7 +691,7 @@ func sortGroups(gs []*Group, by string) {
 	default: // cost
 		less = func(a, b *Group) bool { return a.Eff > b.Eff }
 	}
-	sort.SliceStable(gs, less)
+	sort.SliceStable(gs, func(i, j int) bool { return less(gs[i], gs[j]) })
 }
 
 func tokenSum(g *Group) int64 {
