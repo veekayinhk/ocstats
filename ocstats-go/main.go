@@ -724,7 +724,7 @@ func tok(n int64) string {
 	if neg {
 		n = -n
 	}
-	s := strconv.FormatInt(n, 0)
+	s := strconv.FormatInt(n, 10)
 	var parts []string
 	for len(s) > 3 {
 		parts = append([]string{s[len(s)-3:]}, parts...)
