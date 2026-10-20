@@ -29,7 +29,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 PROG = "ocstats"
 
 DB_ENV = "OCSTATS_DB"
@@ -38,9 +38,12 @@ CACHE_FILE = Path.home() / ".cache/ocstats/api.json"
 OVERRIDES_FILE = Path.home() / ".config/ocstats/pricing.json"
 MODELS_DEV_URL = "https://models.dev/api.json"
 
-DIMENSIONS = ("model", "provider", "agent", "project", "session", "day", "week", "month")
+DOW_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+DIMENSIONS = ("model", "provider", "agent", "project", "session",
+              "day", "week", "month", "hour", "dow")
 DIM_ALIASES = {"date": "day", "daily": "day", "models": "model", "providers": "provider",
-               "agents": "agent", "projects": "project", "sessions": "session"}
+               "agents": "agent", "projects": "project", "sessions": "session",
+               "weekday": "dow", "hourly": "hour"}
 
 SPARK_CHARS = "▁▂▃▄▅▆▇█"
 MD_OUT = False          # global: render tables as GitHub-flavored markdown
@@ -146,6 +149,8 @@ def fetch_rows(conn: sqlite3.Connection, flt) -> list[dict]:
             "day": dt.strftime("%Y-%m-%d"),
             "week": (dt - timedelta(days=dt.weekday())).strftime("%Y-%m-%d"),
             "month": dt.strftime("%Y-%m"),
+            "hour": dt.strftime("%H"),
+            "dow": DOW_NAMES[dt.weekday()],
             "provider": model.get("providerID") or "unknown",
             "model": model.get("id") or "unknown",
             "variant": model.get("variant") or "",
@@ -177,7 +182,9 @@ WHERE sm.type = 'user'
 
 
 def fetch_prompts(conn: sqlite3.Connection, flt) -> list[dict]:
-    """One record per user prompt (message turn), normalized like usage rows."""
+    """One record per user prompt (message turn), normalized like usage rows.
+    Model/provider/agent filters are applied AFTER attribute_prompts() so user
+    rows (which lack model metadata in OpenCode v2) inherit their turn's model."""
     out = []
     for session_id, ts, data, directory in conn.execute(PROMPT_QUERY, (flt.lo, flt.hi)):
         try:
@@ -185,12 +192,6 @@ def fetch_prompts(conn: sqlite3.Connection, flt) -> list[dict]:
         except (json.JSONDecodeError, TypeError):
             continue
         model = d.get("model") or {}
-        if flt.model and flt.model not in (model.get("id") or "").lower():
-            continue
-        if flt.provider and flt.provider not in (model.get("providerID") or "").lower():
-            continue
-        if flt.agent and flt.agent not in (d.get("agent") or "").lower():
-            continue
         if flt.project:
             proj = (Path(directory).name if directory else "(none)").lower()
             if flt.project not in proj and flt.project not in (directory or "").lower():
@@ -203,6 +204,8 @@ def fetch_prompts(conn: sqlite3.Connection, flt) -> list[dict]:
             "day": dt.strftime("%Y-%m-%d"),
             "week": (dt - timedelta(days=dt.weekday())).strftime("%Y-%m-%d"),
             "month": dt.strftime("%Y-%m"),
+            "hour": dt.strftime("%H"),
+            "dow": DOW_NAMES[dt.weekday()],
             "provider": model.get("providerID") or "unknown",
             "model": model.get("id") or "unknown",
             "agent": d.get("agent") or "unknown",
@@ -1383,6 +1386,584 @@ def cmd_pivot(rows, flt, pricing, args):
     print()
 
 
+SERIES_PALETTE = [
+    (C.cyan, "█", "@"),
+    (C.magenta, "▓", "#"),
+    (C.yellow, "▒", "+"),
+    (C.green, "░", "*"),
+    (C.blue, "▪", "="),
+]
+OTHER_STYLE = (C.white, "▫", "~")
+HEAT_BLOCKS = ("░", "▒", "▓", "█")
+MONTH_ABBR = ("", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _norm_by_dim(by_val: str | None) -> str | None:
+    if not by_val:
+        return None
+    d = DIM_ALIASES.get(by_val.strip(), by_val.strip())
+    if d not in DIMENSIONS:
+        sys.exit(f"{PROG}: unknown dimension '{by_val}' "
+                 f"(choose from: {', '.join(DIMENSIONS)})")
+    return d
+
+
+def _heat_block(v: float, mx: float) -> str:
+    if v <= 0 or mx <= 0:
+        return "·"
+    q = v / mx
+    if q > 0.75:
+        return "█"
+    if q > 0.50:
+        return "▓"
+    if q > 0.25:
+        return "▒"
+    return "░"
+
+
+def _color_heat_block(v: float, mx: float, color_fn=None, ascii_sym: str | None = None) -> str:
+    if v <= 0 or mx <= 0:
+        return C.dim("·")
+    blk = _heat_block(v, mx)
+    if color_fn is not None:
+        if not C.enabled and ascii_sym:
+            return ascii_sym
+        q = v / mx
+        return C.bold(color_fn(blk)) if q > 0.75 else color_fn(blk)
+    q = v / mx
+    if q > 0.75:
+        return C.bold(C.cyan("█"))
+    if q > 0.50:
+        return C.cyan("▓")
+    if q > 0.25:
+        return C.green("▒")
+    return C.green("░")
+
+
+def cmd_heatmap(rows, flt, pricing, args):
+    """GitHub-style 7×W contribution calendar, with optional --by and --split."""
+    metric = args.metric or "tokens"
+    if metric not in PIVOT_METRICS:
+        sys.exit(f"{PROG}: --metric must be one of: {', '.join(PIVOT_METRICS)}")
+    by_dim = _norm_by_dim(getattr(args, "by", None))
+    label, metric_fn, fmt = PIVOT_METRICS[metric]
+    fmtv = lambda v: money(v) if fmt == "money" else tok(round(v))  # noqa: E731
+    prompt_rows = getattr(args, "prompt_rows", None)
+
+    day_groups = group_rows(rows, ["day"], pricing, prompt_rows)
+    day_val = {g["day"]: metric_fn(g) for g in day_groups}
+    all_days = sorted(day_val)
+    if not all_days:
+        sys.exit(f"{PROG}: no activity matched the current filters")
+
+    min_dt = datetime.strptime(all_days[0], "%Y-%m-%d").date()
+    max_dt = datetime.strptime(all_days[-1], "%Y-%m-%d").date()
+    last_monday = max_dt - timedelta(days=max_dt.weekday())
+    first_monday = min_dt - timedelta(days=min_dt.weekday())
+
+    req_weeks = getattr(args, "weeks", 0) or 0
+    if req_weeks > 0:
+        first_monday = last_monday - timedelta(weeks=req_weeks - 1)
+    else:
+        n_w = (last_monday - first_monday).days // 7 + 1
+        if n_w < 16 and not args.since:
+            first_monday = last_monday - timedelta(weeks=15)
+        elif n_w > 52:
+            first_monday = last_monday - timedelta(weeks=51)
+    num_weeks = max(1, (last_monday - first_monday).days // 7 + 1)
+
+    # streaks & stats over [min_dt .. max_dt]
+    span_days = (max_dt - min_dt).days + 1
+    active_days = sum(1 for v in day_val.values() if v > 0)
+    longest_streak = cur_streak = run = 0
+    d_iter = min_dt
+    while d_iter <= max_dt:
+        ds = d_iter.strftime("%Y-%m-%d")
+        if day_val.get(ds, 0) > 0:
+            run += 1
+            if run > longest_streak:
+                longest_streak = run
+        else:
+            run = 0
+        d_iter += timedelta(days=1)
+    cur_streak = run
+    peak_day = max(day_val, key=lambda k: day_val[k])
+    peak_val = day_val[peak_day]
+    dow_totals = {d: 0.0 for d in DOW_NAMES}
+    for ds, v in day_val.items():
+        wd = DOW_NAMES[datetime.strptime(ds, "%Y-%m-%d").weekday()]
+        dow_totals[wd] += v
+    busiest_dow = max(DOW_NAMES, key=lambda d: dow_totals[d])
+    grand = sum(day_val.values())
+    mx = peak_val or 1
+
+    # optional breakdown by dimension (model, provider, project, agent, ...)
+    by_day_series = {}
+    series_totals = {}
+    top_series = []
+    style_map = {}
+    if by_dim:
+        sgroups = group_rows(rows, ["day", by_dim], pricing, prompt_rows)
+        for g in sgroups:
+            v = metric_fn(g)
+            s = str(g[by_dim])
+            by_day_series.setdefault(g["day"], {})[s] = v
+            series_totals[s] = series_totals.get(s, 0.0) + v
+        ranked = sorted(series_totals, key=lambda s: -series_totals[s])
+        top_n = args.top or (args.limit if args.limit != 25 else 5)
+        top_series = ranked[:max(1, min(top_n, 5 if not getattr(args, "split", False) else top_n))]
+        for i, s in enumerate(top_series):
+            style_map[s] = SERIES_PALETTE[i % len(SERIES_PALETTE)]
+
+    def dominant_for(ds: str):
+        bk = by_day_series.get(ds)
+        if not bk:
+            return None
+        return max(bk, key=lambda s: bk[s])
+
+    if args.json:
+        days_out = []
+        for ds in all_days:
+            entry = {"day": ds,
+                     "dow": DOW_NAMES[datetime.strptime(ds, "%Y-%m-%d").weekday()],
+                     "value": day_val[ds]}
+            if by_dim:
+                entry["dominant"] = dominant_for(ds)
+                entry["breakdown"] = by_day_series.get(ds, {})
+            days_out.append(entry)
+        print(json.dumps({
+            "meta": meta_json(flt, pricing),
+            "metric": metric,
+            "by": by_dim,
+            "weeks": num_weeks,
+            "stats": {
+                "total": grand,
+                "active_days": active_days,
+                "span_days": span_days,
+                "longest_streak": longest_streak,
+                "current_streak": cur_streak,
+                "peak_day": peak_day,
+                "peak_value": peak_val,
+                "busiest_dow": busiest_dow,
+            },
+            "series_totals": series_totals if by_dim else {},
+            "days": days_out,
+        }, indent=2))
+        return
+
+    if args.csv:
+        w = csv.writer(sys.stdout, lineterminator="\n")
+        hdr = ["day", "dow", "week", metric] + ([f"dominant_{by_dim}"] if by_dim else [])
+        w.writerow(hdr)
+        for ds in all_days:
+            dt_d = datetime.strptime(ds, "%Y-%m-%d").date()
+            wk = (dt_d - timedelta(days=dt_d.weekday())).strftime("%Y-%m-%d")
+            row = [ds, DOW_NAMES[dt_d.weekday()], wk, day_val[ds]]
+            if by_dim:
+                row.append(dominant_for(ds) or "")
+            w.writerow(row)
+        return
+
+    def render_calendar_grid(val_lookup, max_v, fixed_style=None, dom_lookup=None):
+        """Render month header + 7 weekday rows across num_weeks."""
+        # month header (each week column is 2 chars wide)
+        m_chars = [" "] * (num_weeks * 2)
+        last_m = None
+        last_pos = -4
+        for w_i in range(num_weeks):
+            wk_mon = first_monday + timedelta(weeks=w_i)
+            # check if a new month starts in this week
+            m_num = wk_mon.month
+            for offset in range(7):
+                cand = wk_mon + timedelta(days=offset)
+                if cand.day == 1 and cand <= max_dt:
+                    m_num = cand.month
+                    break
+            pos = w_i * 2
+            if m_num != last_m and pos - last_pos >= 4:
+                m_str = MONTH_ABBR[m_num]
+                for ci, ch in enumerate(m_str):
+                    if pos + ci < len(m_chars):
+                        m_chars[pos + ci] = ch
+                last_m = m_num
+                last_pos = pos
+        lines = ["       " + C.dim("".join(m_chars).rstrip())]
+        for wd_i, wd_name in enumerate(DOW_NAMES):
+            cells = []
+            for w_i in range(num_weeks):
+                cur_d = first_monday + timedelta(weeks=w_i, days=wd_i)
+                if cur_d > max_dt:
+                    cells.append("  ")
+                    continue
+                ds = cur_d.strftime("%Y-%m-%d")
+                v = val_lookup.get(ds, 0.0)
+                if fixed_style is not None:
+                    c_fn, _blk, _a_sym = fixed_style
+                    cells.append(_color_heat_block(v, max_v, c_fn, None) + " ")
+                elif dom_lookup is not None and v > 0:
+                    dom = dom_lookup(ds)
+                    c_fn, _blk, a_sym = style_map.get(dom, OTHER_STYLE)
+                    cells.append(_color_heat_block(v, max_v, c_fn, a_sym) + " ")
+                else:
+                    cells.append(_color_heat_block(v, max_v) + " ")
+            lines.append(f"  {C.dim(wd_name)}  " + "".join(cells).rstrip())
+        return lines
+
+    print_hint_pricing(pricing)
+    title = f"{label} · GitHub Contribution Calendar ({num_weeks}w)"
+    if by_dim:
+        mode_s = "split by" if getattr(args, "split", False) else "dominant"
+        title += f" · {mode_s} {by_dim}"
+    print()
+    if MD_OUT:
+        print(f"### {title}\n\n```")
+    else:
+        print(f"  {C.bold(C.cyan(title))}  {C.dim('· ' + flt.describe())}")
+    print()
+
+    if by_dim and getattr(args, "split", False):
+        # stacked mini-calendars per top series
+        for i, s_name in enumerate(top_series):
+            st = SERIES_PALETTE[i % len(SERIES_PALETTE)]
+            c_fn, blk, a_sym = st
+            s_days = {ds: bk.get(s_name, 0.0)
+                      for ds, bk in by_day_series.items() if bk.get(s_name, 0.0) > 0}
+            s_tot = series_totals.get(s_name, 0.0)
+            s_mx = max(s_days.values(), default=0.0) or 1.0
+            swatch = c_fn(blk) if C.enabled else a_sym
+            print(f"  {swatch} {C.bold(s_name)}  "
+                  f"{C.dim(f'{fmtv(s_tot)} ({pct(s_tot / grand if grand else 0)}) · {len(s_days)} active days · peak {fmtv(s_mx)}')}")
+            for ln in render_calendar_grid(s_days, s_mx, fixed_style=st):
+                print(ln)
+            print()
+    else:
+        dom_fn = dominant_for if by_dim else None
+        for ln in render_calendar_grid(day_val, mx, dom_lookup=dom_fn):
+            print(ln)
+        print()
+        print(f"  {C.dim('Legend:')} {C.dim('·')} 0   "
+              f"{_color_heat_block(0.15 * mx, mx)} <25%   "
+              f"{_color_heat_block(0.40 * mx, mx)} 25-50%   "
+              f"{_color_heat_block(0.65 * mx, mx)} 50-75%   "
+              f"{_color_heat_block(0.90 * mx, mx)} >75% (peak {fmtv(peak_val)})")
+        if by_dim and top_series:
+            dom_wins = {}
+            for ds in all_days:
+                if day_val[ds] > 0:
+                    d_s = dominant_for(ds)
+                    if d_s:
+                        dom_wins[d_s] = dom_wins.get(d_s, 0) + 1
+            parts = []
+            for s_name in top_series:
+                c_fn, blk, a_sym = style_map[s_name]
+                sw = c_fn("█") if C.enabled else a_sym
+                sh = pct(series_totals[s_name] / grand if grand else 0)
+                wins = dom_wins.get(s_name, 0)
+                parts.append(f"{sw} {C.bold(truncate(s_name, 22))} {C.dim(f'{sh} ({wins}d)')}")
+            if len(series_totals) > len(top_series):
+                c_fn, _blk, a_sym = OTHER_STYLE
+                sw = c_fn("█") if C.enabled else a_sym
+                parts.append(f"{sw} {C.dim(f'+{len(series_totals) - len(top_series)} other')}")
+            print(f"  {C.dim(by_dim.capitalize() + ':')} " + "   ".join(parts))
+
+    print(f"  {C.dim('Stats:')}  total {C.bold(fmtv(grand))}  ·  "
+          f"active {C.bold(f'{active_days}/{span_days}d')} ({pct(active_days / span_days if span_days else 0)})  ·  "
+          f"peak {C.bold(peak_day)} ({fmtv(peak_val)})  ·  "
+          f"busiest {C.bold(busiest_dow)}  ·  "
+          f"streak {C.bold(f'{cur_streak}d')} (best {longest_streak}d)")
+    if MD_OUT:
+        print("```")
+    print()
+
+
+def cmd_chart(rows, flt, pricing, args):
+    """Stacked ASCII/Unicode time-series bar chart over period × optional series."""
+    period = DIM_ALIASES.get(args.period, args.period)
+    if period not in ("day", "week", "month", "hour", "dow"):
+        sys.exit(f"{PROG}: --period must be one of: day, week, month, hour, dow")
+    by_dim = _norm_by_dim(getattr(args, "by", None))
+    if by_dim == period:
+        sys.exit(f"{PROG}: --period and --by must differ")
+    metric = args.metric or "tokens"
+    if metric not in PIVOT_METRICS:
+        sys.exit(f"{PROG}: --metric must be one of: {', '.join(PIVOT_METRICS)}")
+    label, metric_fn, fmt = PIVOT_METRICS[metric]
+    fmtv = lambda v: money(v) if fmt == "money" else tok(round(v))  # noqa: E731
+    prompt_rows = getattr(args, "prompt_rows", None)
+
+    pgroups = group_rows(rows, [period], pricing, prompt_rows)
+    if not pgroups:
+        sys.exit(f"{PROG}: no activity matched the current filters")
+
+    if period == "dow":
+        dow_idx = {d: i for i, d in enumerate(DOW_NAMES)}
+        pgroups.sort(key=lambda g: dow_idx.get(g["dow"], 99))
+    elif period == "hour":
+        pgroups.sort(key=lambda g: g["hour"])
+    else:
+        sort_by = args.sort or "date-desc"
+        pgroups = sort_groups(pgroups, sort_by, [period])
+    if args.bottom:
+        pgroups = list(reversed(pgroups))
+
+    grand = sum(metric_fn(g) for g in pgroups) or 1.0
+    shown, _rest_n, _hid_n = apply_row_limits(pgroups, args, sum(g["cost_eff"] for g in pgroups) or 1.0)
+    mx = max((metric_fn(g) for g in shown), default=0.0) or 1.0
+
+    by_cell = {}
+    series_totals = {}
+    top_series = []
+    style_map = {}
+    if by_dim:
+        sgroups = group_rows(rows, [period, by_dim], pricing, prompt_rows)
+        for g in sgroups:
+            v = metric_fn(g)
+            s = str(g[by_dim])
+            by_cell.setdefault(g[period], {})[s] = v
+            series_totals[s] = series_totals.get(s, 0.0) + v
+        ranked = sorted(series_totals, key=lambda s: -series_totals[s])
+        top_series = ranked[:5]
+        for i, s in enumerate(top_series):
+            style_map[s] = SERIES_PALETTE[i % len(SERIES_PALETTE)]
+
+    if args.json:
+        out_rows = []
+        for g in shown:
+            pk = g[period]
+            rec = {period: pk, "value": metric_fn(g),
+                   "share": metric_fn(g) / grand if grand else 0.0}
+            if by_dim:
+                bk = by_cell.get(pk, {})
+                rec["dominant"] = max(bk, key=lambda s: bk[s]) if bk else None
+                rec["breakdown"] = bk
+            out_rows.append(rec)
+        print(json.dumps({
+            "meta": meta_json(flt, pricing),
+            "period": period,
+            "by": by_dim,
+            "metric": metric,
+            "grand_total": grand,
+            "series_totals": series_totals if by_dim else {},
+            "rows": out_rows,
+        }, indent=2))
+        return
+
+    if args.csv:
+        w = csv.writer(sys.stdout, lineterminator="\n")
+        if by_dim:
+            w.writerow([period] + top_series + (["other"] if len(series_totals) > 5 else []) + ["total"])
+            for g in shown:
+                pk = g[period]
+                bk = by_cell.get(pk, {})
+                top_v = [bk.get(s, 0) for s in top_series]
+                oth_v = sum(v for s, v in bk.items() if s not in style_map)
+                row = [pk] + top_v + ([oth_v] if len(series_totals) > 5 else []) + [metric_fn(g)]
+                w.writerow(row)
+        else:
+            w.writerow([period, metric, "share"])
+            for g in shown:
+                v = metric_fn(g)
+                w.writerow([g[period], v, v / grand if grand else 0.0])
+        return
+
+    print_hint_pricing(pricing)
+    w = term_width(args)
+    bar_w = max(18, min(48, w - (54 if by_dim else 38)))
+    title = f"{label} over {period}" + (f" · stacked by {by_dim}" if by_dim else "")
+    t = Table(title, width=w)
+    t.col(period.capitalize(), "l", priority=10) \
+     .col("Chart", "l", priority=9) \
+     .col(label, "r", priority=10) \
+     .col("Share", "r", priority=4)
+    if by_dim:
+        t.col(f"Top {by_dim}", "l", priority=3)
+
+    for g in shown:
+        pk = g[period]
+        v = metric_fn(g)
+        filled = round((v / mx) * bar_w) if v > 0 else 0
+        if v > 0 and filled == 0:
+            filled = 1
+        if not by_dim:
+            q = v / mx
+            c_fn = C.bold if q > 0.75 else (C.cyan if q > 0.4 else C.green)
+            b_str = c_fn("█" * filled) + C.dim("░" * (bar_w - filled))
+            t.add(C.bold(pk), b_str, fmtv(v), pct(v / grand if grand else 0))
+        else:
+            bk = by_cell.get(pk, {})
+            ordered = [(s, bk.get(s, 0.0), style_map[s]) for s in top_series if bk.get(s, 0.0) > 0]
+            oth_v = sum(val for s, val in bk.items() if s not in style_map and val > 0)
+            if oth_v > 0:
+                ordered.append(("other", oth_v, OTHER_STYLE))
+            segs = []
+            rem = filled
+            for idx, (_s, sv, st) in enumerate(ordered):
+                if idx == len(ordered) - 1:
+                    slen = max(0, rem)
+                else:
+                    slen = round((sv / v) * filled) if v > 0 else 0
+                    if sv > 0 and slen == 0 and rem > 0:
+                        slen = 1
+                    slen = min(slen, rem)
+                rem -= slen
+                c_fn, blk, _asym = st
+                segs.append(c_fn(blk * slen))
+            b_str = "".join(segs) + C.dim("·" * (bar_w - filled))
+            dom = max(bk, key=lambda s: bk[s]) if bk else "—"
+            dom_pct = pct(bk[dom] / v) if bk and v > 0 else ""
+            t.add(C.bold(pk), b_str, fmtv(v), pct(v / grand if grand else 0),
+                  f"{truncate(dom, 18)} {C.dim(dom_pct)}")
+
+    tot_shown = sum(metric_fn(g) for g in shown)
+    foot = [C.bold("TOTAL"), "", C.bold(C.white(fmtv(tot_shown))),
+            C.bold(pct(tot_shown / grand if grand else 0))]
+    if by_dim:
+        foot.append("")
+    t.set_footer(*foot)
+
+    if by_dim and top_series:
+        leg = []
+        for s_name in top_series:
+            c_fn, blk, _asym = style_map[s_name]
+            sh = pct(series_totals[s_name] / grand if grand else 0)
+            leg.append(f"{c_fn(blk * 2)} {s_name} ({sh})")
+        if len(series_totals) > len(top_series):
+            c_fn, blk, _asym = OTHER_STYLE
+            leg.append(f"{c_fn(blk * 2)} +{len(series_totals) - len(top_series)} other")
+        t.note = "Legend: " + "   ".join(leg)
+    else:
+        t.note = f"metric: {metric} · peak {period}: {fmtv(mx)}"
+
+    print()
+    print(t.render())
+    print()
+
+
+def cmd_punchcard(rows, flt, pricing, args):
+    """7 (Mon–Sun) × 24 (00–23h) circadian activity grid."""
+    metric = args.metric or "tokens"
+    if metric not in PIVOT_METRICS:
+        sys.exit(f"{PROG}: --metric must be one of: {', '.join(PIVOT_METRICS)}")
+    by_dim = _norm_by_dim(getattr(args, "by", None))
+    label, metric_fn, fmt = PIVOT_METRICS[metric]
+    fmtv = lambda v: money(v) if fmt == "money" else tok(round(v))  # noqa: E731
+    prompt_rows = getattr(args, "prompt_rows", None)
+
+    hours = [f"{h:02d}" for h in range(24)]
+    groups = group_rows(rows, ["dow", "hour"], pricing, prompt_rows)
+    if not groups:
+        sys.exit(f"{PROG}: no activity matched the current filters")
+
+    cell = {(g["dow"], g["hour"]): metric_fn(g) for g in groups}
+    dow_tot = {d: sum(cell.get((d, h), 0.0) for h in hours) for d in DOW_NAMES}
+    hr_tot = {h: sum(cell.get((d, h), 0.0) for d in DOW_NAMES) for h in hours}
+    grand = sum(dow_tot.values()) or 1.0
+    mx = max(cell.values(), default=0.0) or 1.0
+
+    by_slot = {}
+    series_totals = {}
+    top_series = []
+    style_map = {}
+    if by_dim:
+        sgroups = group_rows(rows, ["dow", "hour", by_dim], pricing, prompt_rows)
+        for g in sgroups:
+            v = metric_fn(g)
+            s = str(g[by_dim])
+            by_slot.setdefault((g["dow"], g["hour"]), {})[s] = v
+            series_totals[s] = series_totals.get(s, 0.0) + v
+        ranked = sorted(series_totals, key=lambda s: -series_totals[s])
+        top_series = ranked[:5]
+        for i, s in enumerate(top_series):
+            style_map[s] = SERIES_PALETTE[i % len(SERIES_PALETTE)]
+
+    def slot_dom(d: str, h: str):
+        bk = by_slot.get((d, h))
+        return max(bk, key=lambda s: bk[s]) if bk else None
+
+    peak_slot = max(cell, key=lambda k: cell[k]) if cell else ("Mon", "00")
+    peak_hr = max(hours, key=lambda h: hr_tot[h])
+    busiest_dow = max(DOW_NAMES, key=lambda d: dow_tot[d])
+
+    if args.json:
+        cells_out = []
+        for d in DOW_NAMES:
+            for h in hours:
+                v = cell.get((d, h), 0.0)
+                if v > 0:
+                    entry = {"dow": d, "hour": h, "value": v}
+                    if by_dim:
+                        entry["dominant"] = slot_dom(d, h)
+                    cells_out.append(entry)
+        print(json.dumps({
+            "meta": meta_json(flt, pricing),
+            "metric": metric,
+            "by": by_dim,
+            "grand_total": grand,
+            "peak_hour": f"{peak_hr}:00",
+            "peak_slot": f"{peak_slot[0]} {peak_slot[1]}:00",
+            "busiest_dow": busiest_dow,
+            "dow_totals": dow_tot,
+            "hour_totals": hr_tot,
+            "cells": cells_out,
+        }, indent=2))
+        return
+
+    if args.csv:
+        w = csv.writer(sys.stdout, lineterminator="\n")
+        w.writerow(["dow"] + hours + ["TOTAL"])
+        for d in DOW_NAMES:
+            w.writerow([d] + [cell.get((d, h), 0) for h in hours] + [dow_tot[d]])
+        w.writerow(["TOTAL"] + [hr_tot[h] for h in hours] + [grand])
+        return
+
+    print_hint_pricing(pricing)
+    title = f"{label} · 7×24 Activity Punchcard" + (f" · dominant {by_dim}" if by_dim else "")
+    print()
+    if MD_OUT:
+        print(f"### {title}\n\n```")
+    else:
+        print(f"  {C.bold(C.cyan(title))}  {C.dim('· ' + flt.describe())}")
+    print()
+
+    hdr_hours = " ".join(hours)
+    tot_w = max(10, len(fmtv(grand)))
+    print(f"       {C.bold(hdr_hours)} │ {'Total':>{tot_w}} │ Share")
+    print("  " + "─" * 5 + "┼" + "─" * (len(hdr_hours) + 2) + "┼" + "─" * (tot_w + 2) + "┼" + "─" * 7)
+    for d in DOW_NAMES:
+        row_cells = []
+        for h in hours:
+            v = cell.get((d, h), 0.0)
+            if by_dim and v > 0:
+                dom = slot_dom(d, h)
+                c_fn, _blk, a_sym = style_map.get(dom, OTHER_STYLE)
+                ch = _color_heat_block(v, mx, c_fn, a_sym)
+            else:
+                ch = _color_heat_block(v, mx)
+            row_cells.append(f"{ch} ")
+        dtot = dow_tot[d]
+        print(f"  {C.bold(d)}  │ " + " ".join(row_cells) +
+              f"│ {fmtv(dtot):>{tot_w}} │ {pct(dtot / grand if grand else 0):>5}")
+    print("  " + "─" * 5 + "┼" + "─" * (len(hdr_hours) + 2) + "┼" + "─" * (tot_w + 2) + "┼" + "─" * 7)
+    hr_sparks = [ f"{c} " for c in spark([hr_tot[h] for h in hours]) ]
+    print(f"  {C.dim('Mix')}  │ " + " ".join(hr_sparks) +
+          f"│ {C.bold(C.white(f'{fmtv(grand):>{tot_w}}'))} │  100%")
+    print()
+    if by_dim and top_series:
+        parts = []
+        for s_name in top_series:
+            c_fn, _blk, a_sym = style_map[s_name]
+            sw = c_fn("█") if C.enabled else a_sym
+            parts.append(f"{sw} {C.bold(truncate(s_name, 22))} ({pct(series_totals[s_name] / grand)})")
+        print(f"  {C.dim(by_dim.capitalize() + ':')} " + "   ".join(parts))
+    print(f"  {C.dim('Stats:')}  peak hour {C.bold(f'{peak_hr}:00')} ({fmtv(hr_tot[peak_hr])})  ·  "
+          f"peak slot {C.bold(f'{peak_slot[0]} {peak_slot[1]}:00')} ({fmtv(cell.get(peak_slot, 0))})  ·  "
+          f"busiest day {C.bold(busiest_dow)}  ·  active slots {C.bold(f'{sum(1 for v in cell.values() if v > 0)}/168')}")
+    if MD_OUT:
+        print("```")
+    print()
+
+
 def meta_json(flt, pricing) -> dict:
     return {
         "generated": datetime.now(timezone.utc).isoformat(),
@@ -1454,8 +2035,13 @@ def build_parser():
                     "aggregate tokens, prompts, sessions and cost by model, provider,\n"
                     "agent, project, day, week, month, session, or any combination.",
         epilog=(
-            "aggregation examples:\n"
+            "aggregation & chart examples:\n"
             "  ocstats                                   summary of everything\n"
+            "  ocstats heatmap                           GitHub-style contribution calendar\n"
+            "  ocstats heatmap --by model                calendar color-coded by dominant model\n"
+            "  ocstats heatmap --by provider --split     stacked mini-calendars per provider\n"
+            "  ocstats chart --period day --by model     stacked daily bar chart by model\n"
+            "  ocstats punchcard --by model              7×24 circadian grid by model\n"
             "  ocstats models                            usage per provider × model\n"
             "  ocstats providers --since 30d             last 30 days per provider\n"
             "  ocstats daily                             per-day time series\n"
@@ -1470,9 +2056,9 @@ def build_parser():
             "  ocstats sessions --top 5                  5 most expensive sessions\n"
             "  ocstats summary --monthly-budget 50       spend vs a $50 monthly budget\n"
             "\n"
-            "dimensions for matrix --by / pivot --rows / --cols:\n"
-            "  model, provider, agent, project, session, day, week, month\n"
-            "  (comma-separate any combination, e.g. --by project,day,provider)\n"
+            "dimensions for matrix --by / pivot --rows / --cols / heatmap --by / chart --by:\n"
+            "  model, provider, agent, project, session, day, week, month, hour, dow\n"
+            "  (comma-separate any combination in matrix, e.g. --by project,day,provider)\n"
             "\n"
             f"database: ${DB_ENV} overrides {DEFAULT_DB}"),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1517,6 +2103,34 @@ def build_parser():
     pv.add_argument("--metric", default="tokens",
                     help="tokens | in | out | cache | msgs | prompts | cost")
 
+    for hm_name in ("heatmap", "calendar"):
+        hm = sub.add_parser(hm_name, parents=[common], conflict_handler="resolve",
+                            help="GitHub-style contribution calendar (--by model/provider, --split)")
+        hm.add_argument("--by", default=None,
+                        help="color/split by dimension: model, provider, agent, project, session")
+        hm.add_argument("--split", action="store_true",
+                        help="render stacked mini-calendars per top series when --by is set")
+        hm.add_argument("--weeks", type=int, default=0,
+                        help="number of weeks to display (default: auto 16..52)")
+        hm.add_argument("--metric", default="tokens",
+                        help="tokens | in | out | cache | msgs | prompts | cost")
+
+    ch = sub.add_parser("chart", parents=[common], conflict_handler="resolve",
+                        help="stacked ASCII/Unicode bar chart over time (--period, --by)")
+    ch.add_argument("--period", default="day",
+                    help="time bucket: day, week, month, hour, dow (default day)")
+    ch.add_argument("--by", default=None,
+                    help="stack bars by: model, provider, agent, project, session")
+    ch.add_argument("--metric", default="tokens",
+                    help="tokens | in | out | cache | msgs | prompts | cost")
+
+    pc = sub.add_parser("punchcard", parents=[common], conflict_handler="resolve",
+                        help="7×24 (Mon–Sun × 00–23h) circadian activity grid")
+    pc.add_argument("--by", default=None,
+                    help="color slots by dominant: model, provider, agent, project")
+    pc.add_argument("--metric", default="tokens",
+                    help="tokens | in | out | cache | msgs | prompts | cost")
+
     pr = sub.add_parser("prices", parents=[common], help="show resolved pricing table")
     pr.add_argument("--refresh", action="store_true",
                     help="re-fetch models.dev pricing now")
@@ -1525,14 +2139,16 @@ def build_parser():
 
 
 COMMANDS = {"summary", "models", "providers", "agents", "projects", "sessions",
-            "daily", "weekly", "monthly", "matrix", "prices", "pivot"}
+            "daily", "weekly", "monthly", "matrix", "prices", "pivot",
+            "heatmap", "calendar", "chart", "punchcard"}
 
 DEFAULTS = {"no_color": False, "width": 0, "json": False, "since": None,
             "until": None, "model": None, "provider": None, "agent": None,
             "project": None, "session": None, "limit": 25, "sort": None,
             "csv": False, "md": False, "details": False, "top": 0, "bottom": 0,
             "min_share": 0.0, "monthly_budget": None, "compare": None,
-            "metric": None}
+            "metric": None, "by": None, "split": False, "weeks": 0,
+            "period": "day"}
 
 
 def compare_window(spec: str, now: datetime, anchor_hi: int | None = None) -> tuple[int, int]:
@@ -1616,14 +2232,14 @@ def main(argv=None):
 
     conn = open_db(db_path(args))
     rows = flt.apply(fetch_rows(conn, flt))
-    args.prompt_rows = attribute_prompts(fetch_prompts(conn, flt), rows)
+    args.prompt_rows = flt.apply(attribute_prompts(fetch_prompts(conn, flt), rows))
     args.prev = None
     if args.compare:
         plo, phi = args._prev_window
         pflt = Filters(args)
         pflt.lo, pflt.hi = plo, phi
         p_rows = pflt.apply(fetch_rows(conn, pflt))
-        p_prompts = attribute_prompts(fetch_prompts(conn, pflt), p_rows)
+        p_prompts = pflt.apply(attribute_prompts(fetch_prompts(conn, pflt), p_rows))
         args.prev = (p_rows, p_prompts)
         if not p_rows:
             print(f"{PROG}: note: no usage found in the previous comparison window",
@@ -1646,6 +2262,12 @@ def main(argv=None):
         cmd_time_series(rows, flt, pricing, args, dim, args.command)
     elif args.command == "pivot":
         cmd_pivot(rows, flt, pricing, args)
+    elif args.command in ("heatmap", "calendar"):
+        cmd_heatmap(rows, flt, pricing, args)
+    elif args.command == "chart":
+        cmd_chart(rows, flt, pricing, args)
+    elif args.command == "punchcard":
+        cmd_punchcard(rows, flt, pricing, args)
     elif args.command == "matrix":
         dims = [DIM_ALIASES.get(d.strip(), d.strip())
                 for d in args.by.split(",") if d.strip()]

@@ -11,8 +11,13 @@
 #
 # Requires: bash 4, sqlite3 (JSON1), jq, awk, curl (only for prices --refresh)
 #
-# aggregation examples:
+# aggregation & chart examples:
 #   ocstats.sh                                     summary of everything
+#   ocstats.sh heatmap                             GitHub-style contribution calendar
+#   ocstats.sh heatmap --by model                  calendar color-coded by dominant model
+#   ocstats.sh heatmap --by provider --split       stacked mini-calendars per provider
+#   ocstats.sh chart --period day --by model       stacked daily bar chart by model
+#   ocstats.sh punchcard --by model                7×24 circadian grid by model
 #   ocstats.sh models                              per provider × model
 #   ocstats.sh providers --since 30d               last 30 days per provider
 #   ocstats.sh daily                               per-day time series
@@ -24,14 +29,14 @@
 #   ocstats.sh sessions --top 5                    5 most expensive sessions
 #   ocstats.sh summary --monthly-budget 50         spend vs $50 monthly budget
 #
-# dimensions for matrix --by / pivot --rows / --cols:
-#   model, provider, agent, project, session, day, week, month
+# dimensions for matrix --by / pivot --rows / --cols / heatmap --by / chart --by:
+#   model, provider, agent, project, session, day, week, month, hour, dow
 #   (comma-separate any combination, e.g. --by project,day,provider)
 
 set -euo pipefail
 
 PROG="ocstats"
-VERSION="1.1.0"
+VERSION="1.2.0"
 DB="${OCSTATS_DB:-$HOME/.local/share/opencode/opencode.db}"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ocstats"
 CACHE_FILE="$CACHE_DIR/api.json"
@@ -43,12 +48,12 @@ MODELS_DEV_URL="https://models.dev/api.json"
 # ---------------------------------------------------------------------------
 
 BOLD=$'\e[1m'; DIM=$'\e[2m'; RED=$'\e[31m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'
-CYAN=$'\e[36m'; WHITE=$'\e[37m'; RESET=$'\e[0m'
+BLUE=$'\e[34m'; MAGENTA=$'\e[35m'; CYAN=$'\e[36m'; WHITE=$'\e[37m'; RESET=$'\e[0m'
 NO_COLOR_OUT=0
 RENDER_MD=0
 apply_color_switch() {
     if [[ "$NO_COLOR_OUT" == "1" || -n "${NO_COLOR:-}" || ! -t 1 || "$RENDER_MD" == "1" ]]; then
-        BOLD=""; DIM=""; RED=""; GREEN=""; YELLOW=""; CYAN=""; WHITE=""; RESET=""
+        BOLD=""; DIM=""; RED=""; GREEN=""; YELLOW=""; BLUE=""; MAGENTA=""; CYAN=""; WHITE=""; RESET=""
     fi
 }
 
@@ -251,6 +256,7 @@ LIMIT=25; SORT=""; JSON=0; CSV=0; MD=0; DETAILS=0; TOPN=0; BOTTOMN=0; MINSHARE=0
 MONTHLY_BUDGET=""; COMPARE=""; METRIC=""
 CMD="summary"; REFRESH=0; MATRIX_BY=""; NO_COLOR_OUT=0
 PV_ROWS="project"; PV_COLS="day"
+SPLIT=0; WEEKS=0; PERIOD="day"
 LO_MS=0; HI_MS=99999999999999
 CMP_CUR=""; CMP_PREV=""
 
@@ -412,6 +418,17 @@ function civil_from_days(z,  era, doe, yoe, y, doy, mp, cd_d, cd_m, cd_y) {
     return sprintf("%04d-%02d-%02d", cd_y, cd_m, cd_d)
 }
 function daystr(ms) { return civil_from_days(int((ms + tzo) / 86400000)) }
+function hourstr(ms,  rem) {
+    rem = (ms + tzo) % 86400000; if (rem < 0) rem += 86400000
+    return sprintf("%02d", int(rem / 3600000))
+}
+function dowstr(day,  a, dn, dow, names) {
+    split("Mon Tue Wed Thu Fri Sat Sun", names, " ")
+    split(day, a, "-")
+    dn = days_from_civil(a[1] + 0, a[2] + 0, a[3] + 0)
+    dow = (dn + 3) % 7; if (dow < 0) dow += 7
+    return names[dow + 1]
+}
 function monday_of(day,  a, dn, dow) {
     split(day, a, "-")
     dn = days_from_civil(a[1] + 0, a[2] + 0, a[3] + 0)
@@ -432,7 +449,8 @@ function pctile(a, n, p,  k, f, c) {
 function dimv(d,  v) {
     v = (d == "provider" ? prov : d == "model" ? mdl : d == "agent" ? agt :
          d == "session" ? sid : d == "project" ? proj : d == "day" ? d0 :
-         d == "week" ? wk : d == "month" ? mo : "?")
+         d == "week" ? wk : d == "month" ? mo : d == "hour" ? hr :
+         d == "dow" ? dw : "?")
     return v
 }
 # ---- rates ----
@@ -444,6 +462,7 @@ $1 == "U" {
 
     n = split(dir, pa, "/"); proj = (dir == "" ? "(none)" : pa[n])
     d0 = daystr(ts); split(d0, da, "-"); mo = da[1] "-" da[2]; wk = monday_of(d0)
+    hr = hourstr(ts); dw = dowstr(d0)
 
     key = prov "/" mdl
     est = (key in PIN) ? (tin*PIN[key] + tout*POUT[key] + tcr*PCR[key] + tcw*PCW[key]) / 1e6 : 0
@@ -475,6 +494,7 @@ $1 == "P" {
 }
 END {
     # attribute each prompt to the next assistant message in its session
+    matched_p = 0
     for (i = 1; i <= np_; i++) {
         sid = PSID[i]; prov = "unknown"; mdl = "unknown"; agt = "unknown"; proj = "(none)"
         if (sid in STS) {
@@ -483,10 +503,14 @@ END {
             for (j = 1; j <= cnt; j++) if (ts_[j]+0 >= PTS[i]) { pick = j; break }
             split(at_[pick], a_, "\001")
             prov = a_[1]; mdl = a_[2]; agt = a_[3]; proj = a_[4]
+        } else if (has_mpa == 1) {
+            continue
         } else if (PDIR[i] != "") {
             nn = split(PDIR[i], pp, "/"); proj = pp[nn]
         }
+        matched_p++
         d0 = daystr(PTS[i]); split(d0, da, "-"); mo = da[1] "-" da[2]; wk = monday_of(d0)
+        hr = hourstr(PTS[i]); dw = dowstr(d0)
         nd = split(dims, dd, ","); gk = ""
         for (k = 1; k <= nd; k++) gk = gk (k > 1 ? SUBSEP : "") dimv(dd[k])
         PROM[gk]++
@@ -509,16 +533,18 @@ END {
     totpfx = ""
     for (i = 1; i <= nd; i++) totpfx = totpfx "\t"
     printf "%s%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%.6f\t%.6f\t%.6f\t0\t0\t0\t0\t0\t0\n", \
-           totpfx, TN, np_, tnsess, TIN, TOUT, TREAS, TCR, TCW, TREP, TEST_, TEFF
+           totpfx, TN, matched_p, tnsess, TIN, TOUT, TREAS, TCR, TCW, TREP, TEST_, TEFF
 }'
 
 aggregate() { # aggregate <dims csv> <lo_ms> <hi_ms> → group rows (##TOTAL last)
     ensure_data "$2" "$3"
     ensure_rates
+    local has_mpa=0
+    [[ -n "$F_MODEL$F_PROVIDER$F_AGENT" ]] && has_mpa=1
     { awk -F'\t' 'NF >= 6 { print "R\t" $1 "\t" $2 "\t" $3 "\t" $4 "\t" $5 }' "$TMP_RATES"
       awk -F'\t' '{ print "U\t" $0 }' "$ROWS_FILE"
       awk -F'\t' '{ print "P\t" $0 }' "$PROMPTS_FILE"; } \
-        | awk -F'\t' -v dims="$1" -v tzo="$TZOFF" "$AGG_AWK"
+        | awk -F'\t' -v dims="$1" -v tzo="$TZOFF" -v has_mpa="$has_mpa" "$AGG_AWK"
 }
 
 # ---------------------------------------------------------------------------
@@ -923,8 +949,8 @@ cmd_pivot() {
     local -a dims_list=(); local d bad=0
     for d in "$rowdim" "$coldim"; do
         case "$d" in
-            model|provider|agent|project|session|day|week|month) : ;;
-            *) echo "$PROG: --rows/--cols must be one of: model provider agent project session day week month" >&2; exit 1 ;;
+            model|provider|agent|project|session|day|week|month|hour|dow) : ;;
+            *) echo "$PROG: --rows/--cols must be one of: model provider agent project session day week month hour dow" >&2; exit 1 ;;
         esac
     done
     [[ "$rowdim" == "$coldim" ]] && { echo "$PROG: --rows and --cols must differ" >&2; exit 1; }
@@ -1060,6 +1086,552 @@ cmd_pivot() {
     echo
 }
 
+# ---------------------------------------------------------------------------
+# heatmap / calendar, chart, punchcard
+# ---------------------------------------------------------------------------
+
+metric_label_of() {
+    case "$1" in
+        tokens) echo "Tokens";; cost) echo "Σ \$";; msgs) echo "Msgs";;
+        prompts) echo "Prompts";; in) echo "Tok in";; out) echo "Tok out";;
+        cache) echo "Cache hits";; *) echo "$1";;
+    esac
+}
+
+cmd_heatmap() {
+    local metric="${METRIC:-tokens}" by_dim="$MATRIX_BY"
+    local mcol; mcol=$(PIVOT_METRIC_COL "$metric")
+    [[ -z "$mcol" ]] && { echo "$PROG: --metric must be one of: tokens in out cache msgs prompts cost" >&2; exit 1; }
+    if [[ -n "$by_dim" ]]; then
+        case "$by_dim" in
+            model|provider|agent|project|session|day|week|month|hour|dow) : ;;
+            *) echo "$PROG: unknown --by dimension '$by_dim'" >&2; exit 1 ;;
+        esac
+    fi
+    local raw
+    if [[ -n "$by_dim" ]]; then
+        raw=$(aggregate "day,$by_dim" "$LO_MS" "$HI_MS" | awk '/^##TOTAL$/{exit} {print}')
+    else
+        raw=$(aggregate "day" "$LO_MS" "$HI_MS" | awk '/^##TOTAL$/{exit} {print}')
+    fi
+    [[ -z "$raw" ]] && { echo "$PROG: no activity matched the current filters" >&2; exit 1; }
+
+    local nd=1; [[ -n "$by_dim" ]] && nd=2
+    local mc=$((mcol + nd))
+    local label; label=$(metric_label_of "$metric")
+    local has_color=1
+    [[ "$NO_COLOR_OUT" == "1" || -n "${NO_COLOR:-}" || ! -t 1 || "$RENDER_MD" == "1" ]] && has_color=0
+    local top_n=$(( TOPN > 0 ? TOPN : (LIMIT != 25 && LIMIT < 1000 ? LIMIT : 5) ))
+
+    awk -F'\t' -v nd="$nd" -v mc="$mc" -v metric="$metric" -v label="$label" \
+        -v by_dim="$by_dim" -v split_mode="$SPLIT" -v req_weeks="$WEEKS" \
+        -v has_since="$([[ -n "$SINCE" ]] && echo 1 || echo 0)" -v top_n="$top_n" \
+        -v json_out="$JSON" -v csv_out="$CSV" -v md_out="$RENDER_MD" -v has_color="$has_color" \
+        -v B="$BOLD" -v D="$DIM" -v G="$GREEN" -v Y="$YELLOW" -v C="$CYAN" \
+        -v M="$MAGENTA" -v BL="$BLUE" -v W="$WHITE" -v R="$RESET" \
+        "$FMT_FUNCS"'
+        function days_from_civil(y, m, d,  era, yoe, doy, doe) {
+            y -= (m <= 2); era = int((y >= 0 ? y : y - 399) / 400); yoe = y - era * 400
+            doy = int((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5) + d - 1
+            doe = yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy
+            return era * 146097 + doe - 719468
+        }
+        function fmtv(v) { return (metric == "cost" ? money(v) : commas(v)) }
+        function hblk(v, mx,  q) {
+            if (v <= 0 || mx <= 0) return "·"
+            q = v / mx
+            return (q > 0.75 ? "█" : q > 0.50 ? "▓" : q > 0.25 ? "▒" : "░")
+        }
+        function cblk(v, mx, col, asym, is_s,  b, q) {
+            if (v <= 0 || mx <= 0) return D "·" R
+            b = hblk(v, mx); q = v / mx
+            if (is_s) {
+                if (!has_color && asym != "") return asym
+                return (q > 0.75 ? B col b R : col b R)
+            }
+            return (q > 0.75 ? B C "█" R : q > 0.50 ? C "▓" R : q > 0.25 ? G "▒" R : G "░" R)
+        }
+        BEGIN {
+            split("Mon Tue Wed Thu Fri Sat Sun", DOW, " ")
+            split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", MON, " ")
+            PCOL[1]=C; PSYM[1]="@"; PCOL[2]=M; PSYM[2]="#"; PCOL[3]=Y; PSYM[3]="+"
+            PCOL[4]=G; PSYM[4]="*"; PCOL[5]=BL; PSYM[5]="="
+        }
+        {
+            ds = $1; v = $mc + 0
+            DAYV[ds] += v; GRAND += v
+            if (nd == 2) {
+                s = $2; DAYSV[ds SUBSEP s] += v; STOT[s] += v
+                if (!(s in SSeen)) { SSeen[s]=1; NS++; SList[NS]=s }
+            }
+            if (!(ds in DSeen)) { DSeen[ds]=1; ND++; DList[ND]=ds }
+        }
+        END {
+            for (i = 1; i <= ND; i++) for (j = i + 1; j <= ND; j++)
+                if (DList[j] < DList[i]) { t = DList[i]; DList[i] = DList[j]; DList[j] = t }
+            min_ds = DList[1]; max_ds = DList[ND]
+            split(min_ds, a1, "-"); min_dn = days_from_civil(a1[1]+0, a1[2]+0, a1[3]+0)
+            split(max_ds, a2, "-"); max_dn = days_from_civil(a2[1]+0, a2[2]+0, a2[3]+0)
+            dow1 = (min_dn + 3) % 7; if (dow1 < 0) dow1 += 7; first_mon = min_dn - dow1
+            dow2 = (max_dn + 3) % 7; if (dow2 < 0) dow2 += 7; last_mon = max_dn - dow2
+            nw = int((last_mon - first_mon) / 7) + 1
+            if (req_weeks > 0) { first_mon = last_mon - (req_weeks - 1) * 7; nw = req_weeks }
+            else if (nw < 16 && !has_since) { first_mon = last_mon - 15 * 7; nw = 16 }
+            else if (nw > 52) { first_mon = last_mon - 51 * 7; nw = 52 }
+
+            # stats & streaks
+            span_days = max_dn - min_dn + 1
+            active_days = 0; best_str = 0; cur_str = 0; peak_v = -1; peak_d = min_ds
+            for (dn = min_dn; dn <= max_dn; dn++) {
+                ds = civil_from_days(dn); v = DAYV[ds] + 0
+                if (v > 0) { active_days++; cur_str++; if (cur_str > best_str) best_str = cur_str }
+                else cur_str = 0
+                if (v > peak_v) { peak_v = v; peak_d = ds }
+                wd = (dn + 3) % 7 + 1; DOWT[wd] += v
+            }
+            best_wd = 1; for (w = 2; w <= 7; w++) if (DOWT[w] > DOWT[best_wd]) best_wd = w
+            mx = (peak_v > 0 ? peak_v : 1)
+
+            # rank series if by_dim
+            if (nd == 2) {
+                for (i = 1; i <= NS; i++) for (j = i + 1; j <= NS; j++)
+                    if (STOT[SList[j]] > STOT[SList[i]]) { t = SList[i]; SList[i] = SList[j]; SList[j] = t }
+                ntop = (split_mode ? (NS < top_n ? NS : top_n) : (NS < 5 ? NS : 5))
+                for (i = 1; i <= ntop; i++) { SRANK[SList[i]] = i }
+                for (i = 1; i <= ND; i++) {
+                    ds = DList[i]; best_s = ""; best_sv = -1
+                    for (j = 1; j <= NS; j++) {
+                        sv = DAYSV[ds SUBSEP SList[j]] + 0
+                        if (sv > best_sv && sv > 0) { best_sv = sv; best_s = SList[j] }
+                    }
+                    DOM[ds] = best_s; if (best_s != "") WINS[best_s]++
+                }
+            }
+
+            if (json_out) {
+                printf "{\"metric\": \"%s\", \"weeks\": %d, \"stats\": {\"total\": %.6f, \"active_days\": %d, \"span_days\": %d, \"longest_streak\": %d, \"current_streak\": %d, \"peak_day\": \"%s\", \"peak_value\": %.6f, \"busiest_dow\": \"%s\"}, \"days\": [", \
+                       metric, nw, GRAND, active_days, span_days, best_str, cur_str, peak_d, peak_v, DOW[best_wd]
+                for (i = 1; i <= ND; i++) {
+                    ds = DList[i]; split(ds, da, "-"); dn = days_from_civil(da[1]+0, da[2]+0, da[3]+0)
+                    wd = (dn + 3) % 7 + 1
+                    printf "%s{\"day\": \"%s\", \"dow\": \"%s\", \"value\": %.6f%s}", \
+                           (i > 1 ? ", " : ""), ds, DOW[wd], DAYV[ds], \
+                           (nd == 2 ? sprintf(", \"dominant\": \"%s\"", DOM[ds]) : "")
+                }
+                print "]}"
+                exit 0
+            }
+            if (csv_out) {
+                printf "day,dow,week,%s%s\n", metric, (nd == 2 ? ",dominant_" by_dim : "")
+                for (i = 1; i <= ND; i++) {
+                    ds = DList[i]; split(ds, da, "-"); dn = days_from_civil(da[1]+0, da[2]+0, da[3]+0)
+                    wd = (dn + 3) % 7
+                    wk = civil_from_days(dn - wd)
+                    printf "%s,%s,%s,%.6f%s\n", ds, DOW[wd+1], wk, DAYV[ds], (nd == 2 ? "," DOM[ds] : "")
+                }
+                exit 0
+            }
+
+            title = sprintf("%s · GitHub Contribution Calendar (%dw)", label, nw)
+            if (nd == 2) title = title " · " (split_mode ? "split by " : "dominant ") by_dim
+            print ""
+            if (md_out) printf "### %s\n\n```\n\n", title
+            else printf "  %s%s%s\n\n", B C, title, R
+
+            # month header line
+            mhdr = "       "; last_m = -1; last_p = -4
+            for (w = 0; w < nw; w++) {
+                w_dn = first_mon + w * 7; w_ds = civil_from_days(w_dn)
+                split(w_ds, wa, "-"); m_num = wa[2] + 0
+                for (off = 0; off < 7; off++) {
+                    if (w_dn + off <= max_dn) {
+                        cds = civil_from_days(w_dn + off); split(cds, ca, "-")
+                        if (ca[3] + 0 == 1) { m_num = ca[2] + 0; break }
+                    }
+                }
+                if (m_num != last_m && w * 2 - last_p >= 4) {
+                    MAT[w] = MON[m_num]; last_m = m_num; last_p = w * 2
+                }
+            }
+            pos = 0; mline = ""
+            for (w = 0; w < nw; w++) {
+                if (w in MAT) { mline = mline MAT[w]; w++; if (w < nw) mline = mline " " }
+                else mline = mline "  "
+            }
+
+            if (nd == 2 && split_mode) {
+                for (si = 1; si <= ntop; si++) {
+                    sn = SList[si]; col = PCOL[(si-1)%5+1]; sym = PSYM[(si-1)%5+1]
+                    smx = 0; sact = 0
+                    for (i = 1; i <= ND; i++) {
+                        sv = DAYSV[DList[i] SUBSEP sn] + 0
+                        if (sv > 0) sact++
+                        if (sv > smx) smx = sv
+                    }
+                    if (smx <= 0) smx = 1
+                    sw = (has_color ? col "█" R : sym)
+                    printf "  %s %s%s%s  %s%s (%.1f%%) · %d active days · peak %s%s\n", \
+                           sw, B, sn, R, D, fmtv(STOT[sn]), (GRAND>0 ? STOT[sn]/GRAND*100 : 0), sact, fmtv(smx), R
+                    printf "       %s%s%s\n", D, mline, R
+                    for (wd = 0; wd < 7; wd++) {
+                        printf "  %s%s%s  ", D, DOW[wd+1], R
+                        for (w = 0; w < nw; w++) {
+                            cdn = first_mon + w * 7 + wd
+                            if (cdn > max_dn) { printf "  "; continue }
+                            cds = civil_from_days(cdn); sv = DAYSV[cds SUBSEP sn] + 0
+                            printf "%s ", cblk(sv, smx, col, "", 1)
+                        }
+                        print ""
+                    }
+                    print ""
+                }
+            } else {
+                printf "       %s%s%s\n", D, mline, R
+                for (wd = 0; wd < 7; wd++) {
+                    printf "  %s%s%s  ", D, DOW[wd+1], R
+                    for (w = 0; w < nw; w++) {
+                        cdn = first_mon + w * 7 + wd
+                        if (cdn > max_dn) { printf "  "; continue }
+                        cds = civil_from_days(cdn); v = DAYV[cds] + 0
+                        if (nd == 2 && v > 0) {
+                            dom = DOM[cds]; r_i = SRANK[dom]
+                            col = (r_i ? PCOL[(r_i-1)%5+1] : W)
+                            sym = (r_i ? PSYM[(r_i-1)%5+1] : "~")
+                            printf "%s ", cblk(v, mx, col, sym, 1)
+                        } else {
+                            printf "%s ", cblk(v, mx, "", "", 0)
+                        }
+                    }
+                    print ""
+                }
+                print ""
+                printf "  %sLegend:%s %s·%s 0   %s <25%%   %s 25-50%%   %s 50-75%%   %s >75%% (peak %s)\n", \
+                       D, R, D, R, cblk(0.15*mx,mx,"","",0), cblk(0.4*mx,mx,"","",0), cblk(0.65*mx,mx,"","",0), cblk(0.9*mx,mx,"","",0), fmtv(peak_v)
+                if (nd == 2 && ntop > 0) {
+                    printf "  %s%s:%s ", D, toupper(substr(by_dim,1,1)) substr(by_dim,2), R
+                    for (si = 1; si <= ntop; si++) {
+                        sn = SList[si]; col = PCOL[(si-1)%5+1]; sym = PSYM[(si-1)%5+1]
+                        sw = (has_color ? col "█" R : sym)
+                        printf "%s%s %s%s%s %s%.1f%% (%dd)%s", (si>1 ? "   " : ""), sw, B, sn, R, D, (GRAND>0 ? STOT[sn]/GRAND*100 : 0), WINS[sn]+0, R
+                    }
+                    print ""
+                }
+            }
+            printf "  %sStats:%s  total %s%s%s  ·  active %s%d/%dd%s (%.1f%%)  ·  peak %s%s%s (%s)  ·  busiest %s%s%s  ·  streak %s%dd%s (best %dd)\n", \
+                   D, R, B, fmtv(GRAND), R, B, active_days, span_days, R, (span_days>0 ? active_days/span_days*100 : 0), \
+                   B, peak_d, R, fmtv(peak_v), B, DOW[best_wd], R, B, cur_str, R, best_str
+            if (md_out) print "```"
+            print ""
+        }' <<<"$raw"
+}
+
+cmd_chart() {
+    local period="$PERIOD" by_dim="$MATRIX_BY" metric="${METRIC:-tokens}"
+    case "$period" in
+        date|daily) period="day" ;;
+        weekday)    period="dow" ;;
+        hourly)     period="hour" ;;
+    esac
+    case "$period" in
+        day|week|month|hour|dow) : ;;
+        *) echo "$PROG: --period must be one of: day week month hour dow" >&2; exit 1 ;;
+    esac
+    if [[ -n "$by_dim" ]]; then
+        case "$by_dim" in
+            model|provider|agent|project|session|day|week|month|hour|dow) : ;;
+            *) echo "$PROG: unknown --by dimension '$by_dim'" >&2; exit 1 ;;
+        esac
+        [[ "$by_dim" == "$period" ]] && { echo "$PROG: --period and --by must differ" >&2; exit 1; }
+    fi
+    local mcol; mcol=$(PIVOT_METRIC_COL "$metric")
+    [[ -z "$mcol" ]] && { echo "$PROG: --metric must be one of: tokens in out cache msgs prompts cost" >&2; exit 1; }
+
+    local raw
+    if [[ -n "$by_dim" ]]; then
+        raw=$(aggregate "$period,$by_dim" "$LO_MS" "$HI_MS" | awk '/^##TOTAL$/{exit} {print}')
+    else
+        raw=$(aggregate "$period" "$LO_MS" "$HI_MS" | awk '/^##TOTAL$/{exit} {print}')
+    fi
+    [[ -z "$raw" ]] && { echo "$PROG: no activity matched the current filters" >&2; exit 1; }
+
+    local nd=1; [[ -n "$by_dim" ]] && nd=2
+    local mc=$((mcol + nd))
+    local label; label=$(metric_label_of "$metric")
+    local limit=$(( TOPN > 0 ? TOPN : (BOTTOMN > 0 ? BOTTOMN : LIMIT) ))
+
+    if ((JSON)); then
+        awk -F'\t' -v nd="$nd" -v mc="$mc" -v pdim="$period" -v bdim="$by_dim" -v metric="$metric" '
+            { pk = $1; v = $mc + 0; PT[pk] += v; GRAND += v
+              if (!(pk in PSeen)) { PSeen[pk]=1; NP++; PList[NP]=pk }
+              if (nd == 2 && $2 != "") { BK[pk SUBSEP $2] += v; if (BK[pk SUBSEP $2] > DOMV[pk]) { DOMV[pk] = BK[pk SUBSEP $2]; DOM[pk] = $2 } } }
+            END {
+                printf "{\"period\": \"%s\", \"metric\": \"%s\", \"grand_total\": %.6f, \"rows\": [", pdim, metric, GRAND
+                for (i = 1; i <= NP; i++) {
+                    pk = PList[i]; v = PT[pk]
+                    printf "%s{\"%s\": \"%s\", \"value\": %.6f, \"share\": %.6f%s}", \
+                           (i > 1 ? ", " : ""), pdim, pk, v, (GRAND > 0 ? v / GRAND : 0), \
+                           (nd == 2 ? sprintf(", \"dominant\": \"%s\"", DOM[pk]) : "")
+                }
+                print "]}"
+            }' <<<"$raw" | jq .
+        return
+    fi
+    if ((CSV)); then
+        printf '%s,%s,share%s\n' "$period" "$metric" "$([[ -n "$by_dim" ]] && echo ",dominant_$by_dim" || echo "")"
+        awk -F'\t' -v nd="$nd" -v mc="$mc" '
+            { pk = $1; v = $mc + 0; PT[pk] += v; GRAND += v
+              if (!(pk in PSeen)) { PSeen[pk]=1; NP++; PList[NP]=pk }
+              if (nd == 2) { BK[pk SUBSEP $2] += v; if (BK[pk SUBSEP $2] > DOMV[pk]) { DOMV[pk] = BK[pk SUBSEP $2]; DOM[pk] = $2 } } }
+            END {
+                for (i = 1; i <= NP; i++) {
+                    pk = PList[i]; v = PT[pk]
+                    printf "%s,%.6f,%.6f%s\n", pk, v, (GRAND > 0 ? v / GRAND : 0), (nd == 2 ? "," DOM[pk] : "")
+                }
+            }' <<<"$raw"
+        return
+    fi
+
+    print_pricing_hint
+    local title="$label over $period"
+    [[ -n "$by_dim" ]] && title+=" · stacked by $by_dim"
+    local chart_tsv
+    chart_tsv=$(awk -F'\t' -v nd="$nd" -v mc="$mc" -v pdim="$period" -v bdim="$by_dim" \
+        -v metric="$metric" -v label="$label" -v lim="$limit" \
+        -v B="$BOLD" -v D="$DIM" -v G="$GREEN" -v Y="$YELLOW" -v C="$CYAN" \
+        -v M="$MAGENTA" -v BL="$BLUE" -v W="$WHITE" -v R="$RESET" \
+        "$FMT_FUNCS"'
+        function fmtv(v) { return (metric == "cost" ? money(v) : commas(v)) }
+        BEGIN {
+            PCOL[1]=C; PBLK[1]="█"; PCOL[2]=M; PBLK[2]="▓"; PCOL[3]=Y; PBLK[3]="▒"
+            PCOL[4]=G; PBLK[4]="░"; PCOL[5]=BL; PBLK[5]="▪"; PCOL[6]=W; PBLK[6]="▫"
+            DOW_O["Mon"]=1; DOW_O["Tue"]=2; DOW_O["Wed"]=3; DOW_O["Thu"]=4
+            DOW_O["Fri"]=5; DOW_O["Sat"]=6; DOW_O["Sun"]=7
+        }
+        {
+            pk = $1; v = $mc + 0; PT[pk] += v; GRAND += v
+            if (!(pk in PSeen)) { PSeen[pk]=1; NP++; PList[NP]=pk }
+            if (nd == 2) {
+                s = $2; BK[pk SUBSEP s] += v; STOT[s] += v
+                if (!(s in SSeen)) { SSeen[s]=1; NS++; SList[NS]=s }
+            }
+        }
+        END {
+            # sort periods
+            for (i = 1; i <= NP; i++) for (j = i + 1; j <= NP; j++) {
+                swap = 0
+                if (pdim == "dow") swap = (DOW_O[PList[j]] < DOW_O[PList[i]])
+                else if (pdim == "hour") swap = (PList[j] < PList[i])
+                else swap = (PList[j] > PList[i])
+                if (swap) { t = PList[i]; PList[i] = PList[j]; PList[j] = t }
+            }
+            nshow = (lim > 0 && NP > lim ? lim : NP)
+            mx = 0; for (i = 1; i <= nshow; i++) if (PT[PList[i]] > mx) mx = PT[PList[i]]
+            if (mx <= 0) mx = 1
+
+            if (nd == 2) {
+                for (i = 1; i <= NS; i++) for (j = i + 1; j <= NS; j++)
+                    if (STOT[SList[j]] > STOT[SList[i]]) { t = SList[i]; SList[i] = SList[j]; SList[j] = t }
+                ntop = (NS < 5 ? NS : 5)
+            }
+
+            bar_w = 36
+            hdr = toupper(substr(pdim,1,1)) substr(pdim,2) "\tChart\t" label "\tShare"
+            if (nd == 2) hdr = hdr "\tTop " bdim
+            print hdr
+
+            tot_sh = 0
+            for (i = 1; i <= nshow; i++) {
+                pk = PList[i]; v = PT[pk]; tot_sh += v
+                filled = (v > 0 ? int(v / mx * bar_w + 0.5) : 0)
+                if (v > 0 && filled == 0) filled = 1
+                if (nd == 1) {
+                    bstr = ""; for (b = 1; b <= filled; b++) bstr = bstr "█"
+                    pad = ""; for (b = filled + 1; b <= bar_w; b++) pad = pad "░"
+                    col = (v / mx > 0.75 ? B C : (v / mx > 0.4 ? C : G))
+                    print B pk R "\t" col bstr R D pad R "\t" fmtv(v) "\t" sprintf("%.1f%%", (GRAND>0 ? v/GRAND*100 : 0))
+                } else {
+                    rem = filled; bstr = ""; dom_s = "—"; dom_v = -1
+                    for (si = 1; si <= NS; si++) {
+                        sv = BK[pk SUBSEP SList[si]] + 0
+                        if (sv > dom_v && sv > 0) { dom_v = sv; dom_s = SList[si] }
+                    }
+                    # build segments across top 5 + other
+                    oth_v = v
+                    for (si = 1; si <= ntop; si++) oth_v -= (BK[pk SUBSEP SList[si]] + 0)
+                    for (si = 1; si <= ntop + (oth_v > 0 ? 1 : 0); si++) {
+                        sv = (si <= ntop ? BK[pk SUBSEP SList[si]] + 0 : oth_v)
+                        if (sv <= 0) continue
+                        slen = (v > 0 ? int(sv / v * filled + 0.5) : 0)
+                        if (slen == 0 && rem > 0) slen = 1
+                        if (slen > rem) slen = rem
+                        rem -= slen
+                        seg = ""; for (b = 1; b <= slen; b++) seg = seg PBLK[si]
+                        bstr = bstr PCOL[si] seg R
+                    }
+                    while (rem > 0) { bstr = bstr PCOL[1] PBLK[1] R; rem-- }
+                    pad = ""; for (b = filled + 1; b <= bar_w; b++) pad = pad "·"
+                    dpct = (v > 0 && dom_v > 0 ? sprintf(" %.1f%%", dom_v / v * 100) : "")
+                    print B pk R "\t" bstr D pad R "\t" fmtv(v) "\t" sprintf("%.1f%%", (GRAND>0 ? v/GRAND*100 : 0)) "\t" dom_s D dpct R
+                }
+            }
+            foot = B "TOTAL" R "\t \t" B W fmtv(tot_sh) R "\t" B sprintf("%.1f%%", (GRAND>0 ? tot_sh/GRAND*100 : 0)) R
+            if (nd == 2) foot = foot "\t "
+            print foot
+        }' <<<"$raw")
+
+    local aligns="llrr"
+    [[ -n "$by_dim" ]] && aligns="llrrl"
+    echo
+    printf '%s\n' "$chart_tsv" | render_tsv "$title" "$aligns" 1 \
+       "metric: $metric · period: $period$([[ -n "$by_dim" ]] && echo " · stacked by $by_dim" || echo "")"
+    echo
+}
+
+cmd_punchcard() {
+    local metric="${METRIC:-tokens}" by_dim="$MATRIX_BY"
+    local mcol; mcol=$(PIVOT_METRIC_COL "$metric")
+    [[ -z "$mcol" ]] && { echo "$PROG: --metric must be one of: tokens in out cache msgs prompts cost" >&2; exit 1; }
+    if [[ -n "$by_dim" ]]; then
+        case "$by_dim" in
+            model|provider|agent|project|session) : ;;
+            *) echo "$PROG: unknown --by dimension '$by_dim'" >&2; exit 1 ;;
+        esac
+    fi
+    local raw
+    if [[ -n "$by_dim" ]]; then
+        raw=$(aggregate "dow,hour,$by_dim" "$LO_MS" "$HI_MS" | awk '/^##TOTAL$/{exit} {print}')
+    else
+        raw=$(aggregate "dow,hour" "$LO_MS" "$HI_MS" | awk '/^##TOTAL$/{exit} {print}')
+    fi
+    [[ -z "$raw" ]] && { echo "$PROG: no activity matched the current filters" >&2; exit 1; }
+
+    local nd=2; [[ -n "$by_dim" ]] && nd=3
+    local mc=$((mcol + nd))
+    local label; label=$(metric_label_of "$metric")
+    local has_color=1
+    [[ "$NO_COLOR_OUT" == "1" || -n "${NO_COLOR:-}" || ! -t 1 || "$RENDER_MD" == "1" ]] && has_color=0
+
+    awk -F'\t' -v nd="$nd" -v mc="$mc" -v metric="$metric" -v label="$label" \
+        -v by_dim="$by_dim" -v json_out="$JSON" -v csv_out="$CSV" \
+        -v md_out="$RENDER_MD" -v has_color="$has_color" \
+        -v B="$BOLD" -v D="$DIM" -v G="$GREEN" -v Y="$YELLOW" -v C="$CYAN" \
+        -v M="$MAGENTA" -v BL="$BLUE" -v W="$WHITE" -v R="$RESET" \
+        "$FMT_FUNCS"'
+        function fmtv(v) { return (metric == "cost" ? money(v) : commas(v)) }
+        function cblk(v, mx, col, asym, is_s,  b, q) {
+            if (v <= 0 || mx <= 0) return D "·" R
+            q = v / mx
+            b = (q > 0.75 ? "█" : q > 0.50 ? "▓" : q > 0.25 ? "▒" : "░")
+            if (is_s) {
+                if (!has_color && asym != "") return asym
+                return (q > 0.75 ? B col b R : col b R)
+            }
+            return (q > 0.75 ? B C "█" R : q > 0.50 ? C "▓" R : q > 0.25 ? G "▒" R : G "░" R)
+        }
+        BEGIN {
+            split("Mon Tue Wed Thu Fri Sat Sun", DOW, " ")
+            for (h = 0; h < 24; h++) HRS[h+1] = sprintf("%02d", h)
+            PCOL[1]=C; PSYM[1]="@"; PCOL[2]=M; PSYM[2]="#"; PCOL[3]=Y; PSYM[3]="+"
+            PCOL[4]=G; PSYM[4]="*"; PCOL[5]=BL; PSYM[5]="="
+        }
+        {
+            d = $1; h = $2; v = $mc + 0
+            CELL[d SUBSEP h] += v; DTOT[d] += v; HTOT[h] += v; GRAND += v
+            if (nd == 3) {
+                s = $3; SCELL[d SUBSEP h SUBSEP s] += v; STOT[s] += v
+                if (!(s in SSeen)) { SSeen[s]=1; NS++; SList[NS]=s }
+            }
+        }
+        END {
+            mx = 0; best_d = "Mon"; best_h = "00"; best_slot_d = "Mon"; best_slot_h = "00"; active_slots = 0
+            for (di = 1; di <= 7; di++) {
+                d = DOW[di]
+                if (DTOT[d] > DTOT[best_d]) best_d = d
+                for (hi = 1; hi <= 24; hi++) {
+                    h = HRS[hi]; v = CELL[d SUBSEP h] + 0
+                    if (v > 0) active_slots++
+                    if (v > mx) { mx = v; best_slot_d = d; best_slot_h = h }
+                }
+            }
+            for (hi = 1; hi <= 24; hi++) if (HTOT[HRS[hi]] > HTOT[best_h]) best_h = HRS[hi]
+            if (mx <= 0) mx = 1
+
+            if (nd == 3) {
+                for (i = 1; i <= NS; i++) for (j = i + 1; j <= NS; j++)
+                    if (STOT[SList[j]] > STOT[SList[i]]) { t = SList[i]; SList[i] = SList[j]; SList[j] = t }
+                ntop = (NS < 5 ? NS : 5)
+                for (i = 1; i <= ntop; i++) SRANK[SList[i]] = i
+                for (di = 1; di <= 7; di++) for (hi = 1; hi <= 24; hi++) {
+                    d = DOW[di]; h = HRS[hi]; bs = ""; bv = -1
+                    for (si = 1; si <= NS; si++) {
+                        sv = SCELL[d SUBSEP h SUBSEP SList[si]] + 0
+                        if (sv > bv && sv > 0) { bv = sv; bs = SList[si] }
+                    }
+                    DOM[d SUBSEP h] = bs
+                }
+            }
+
+            if (json_out) {
+                printf "{\"metric\": \"%s\", \"grand_total\": %.6f, \"peak_hour\": \"%s:00\", \"peak_slot\": \"%s %s:00\", \"busiest_dow\": \"%s\", \"cells\": [", \
+                       metric, GRAND, best_h, best_slot_d, best_slot_h, best_d
+                first = 1
+                for (di = 1; di <= 7; di++) for (hi = 1; hi <= 24; hi++) {
+                    d = DOW[di]; h = HRS[hi]; v = CELL[d SUBSEP h] + 0
+                    if (v <= 0) continue
+                    printf "%s{\"dow\": \"%s\", \"hour\": \"%s\", \"value\": %.6f%s}", \
+                           (first ? "" : ", "), d, h, v, (nd == 3 ? sprintf(", \"dominant\": \"%s\"", DOM[d SUBSEP h]) : "")
+                    first = 0
+                }
+                print "]}"
+                exit 0
+            }
+            if (csv_out) {
+                printf "dow"
+                for (hi = 1; hi <= 24; hi++) printf ",%s", HRS[hi]
+                print ",TOTAL"
+                for (di = 1; di <= 7; di++) {
+                    d = DOW[di]; printf "%s", d
+                    for (hi = 1; hi <= 24; hi++) printf ",%.6f", CELL[d SUBSEP HRS[hi]] + 0
+                    printf ",%.6f\n", DTOT[d] + 0
+                }
+                exit 0
+            }
+
+            title = label " · 7×24 Activity Punchcard" (nd == 3 ? " · dominant " by_dim : "")
+            print ""
+            if (md_out) printf "### %s\n\n```\n\n", title
+            else printf "  %s%s%s\n\n", B C, title, R
+
+            tot_w = length(fmtv(GRAND)); if (tot_w < 10) tot_w = 10
+            printf "       %s", B
+            for (hi = 1; hi <= 24; hi++) printf "%s%s", (hi > 1 ? " " : ""), HRS[hi]
+            printf "%s │ %*s │ Share\n", R, tot_w, "Total"
+            sep = "  ─────┼"; for (k = 1; k <= 73; k++) sep = sep "─"; sep = sep "┼"
+            for (k = 1; k <= tot_w + 2; k++) sep = sep "─"; sep = sep "┼───────"
+            print sep
+
+            for (di = 1; di <= 7; di++) {
+                d = DOW[di]; printf "  %s%s%s  │ ", B, d, R
+                for (hi = 1; hi <= 24; hi++) {
+                    h = HRS[hi]; v = CELL[d SUBSEP h] + 0
+                    if (nd == 3 && v > 0) {
+                        dom = DOM[d SUBSEP h]; ri = SRANK[dom]
+                        col = (ri ? PCOL[(ri-1)%5+1] : W); sym = (ri ? PSYM[(ri-1)%5+1] : "~")
+                        printf "%s  ", cblk(v, mx, col, sym, 1)
+                    } else {
+                        printf "%s  ", cblk(v, mx, "", "", 0)
+                    }
+                }
+                printf "│ %*s │ %5.1f%%\n", tot_w, fmtv(DTOT[d]), (GRAND > 0 ? DTOT[d] / GRAND * 100 : 0)
+            }
+            print sep
+            printf "  %sStats:%s  peak hour %s%s:00%s (%s)  ·  peak slot %s%s %s:00%s (%s)  ·  busiest day %s%s%s  ·  active slots %s%d/168%s\n", \
+                   D, R, B, best_h, R, fmtv(HTOT[best_h]), B, best_slot_d, best_slot_h, R, fmtv(mx), B, best_d, R, B, active_slots, R
+            if (md_out) print "```"
+            print ""
+        }' <<<"$raw"
+}
+
 
 
 # ---------------------------------------------------------------------------
@@ -1113,11 +1685,11 @@ cmd_prices() {
 # argument parsing
 # ---------------------------------------------------------------------------
 
-COMMANDS="summary models providers agents projects sessions daily weekly monthly matrix pivot prices"
+COMMANDS="summary models providers agents projects sessions daily weekly monthly matrix pivot heatmap calendar chart punchcard prices"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        summary|models|providers|agents|projects|sessions|daily|weekly|monthly|matrix|pivot|prices)
+        summary|models|providers|agents|projects|sessions|daily|weekly|monthly|matrix|pivot|heatmap|calendar|chart|punchcard|prices)
             CMD="$1" ;;
         --since)    SINCE="$2"; shift ;;
         --until)    UNTIL="$2"; shift ;;
@@ -1131,6 +1703,9 @@ while [[ $# -gt 0 ]]; do
         --by)       MATRIX_BY="$2"; shift ;;
         --rows)     PV_ROWS="$2"; shift ;;
         --cols)     PV_COLS="$2"; shift ;;
+        --period)   PERIOD="$2"; shift ;;
+        --weeks)    WEEKS="$2"; shift ;;
+        --split)    SPLIT=1 ;;
         --metric)   METRIC="$2"; shift ;;
         --json)     JSON=1 ;;
         --csv)      CSV=1 ;;
@@ -1145,14 +1720,17 @@ while [[ $# -gt 0 ]]; do
         --refresh)  REFRESH=1 ;;
         --width)    shift ;; # accepted for parity; layout adapts automatically
         -h|--help)
-            sed -n '/^# aggregation examples:/,/^#   (comma-separate/p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '/^# aggregation & chart examples:/,/^#   (comma-separate/p' "$0" | sed 's/^# \{0,1\}//'
             echo
             echo "commands: $COMMANDS"
             echo "filters: --since --until --model --provider --agent --project --session"
             echo "output:  --json --csv --md --details --limit N --top N --bottom N --min-share P"
             echo "         --sort cost|rep|est|tokens|msgs|sessions|name|date|date-desc --no-color"
-            echo "matrix:  --by provider,model,day,week,month,agent,project,session --metric M"
+            echo "matrix:  --by provider,model,day,week,month,hour,dow,agent,project,session --metric M"
             echo "pivot:   --rows DIM --cols DIM --metric tokens|in|out|cache|msgs|prompts|cost"
+            echo "heatmap: [--by DIM] [--split] [--weeks N] [--metric M]  (alias: calendar)"
+            echo "chart:   [--period day|week|month|hour|dow] [--by DIM] [--metric M]"
+            echo "punchcard: [--by DIM] [--metric M]"
             echo "extra:   --monthly-budget AMOUNT --compare CUR/PREV (e.g. 7d/7d) --refresh"
             exit 0 ;;
         --version) echo "$PROG $VERSION"; exit 0 ;;
@@ -1183,14 +1761,17 @@ case "$CMD" in
     weekly)    SORT="${SORT:-date-desc}"; group_report "Usage by week" "week" ;;
     monthly)   SORT="${SORT:-date-desc}"; group_report "Usage by month" "month" ;;
     pivot)     cmd_pivot ;;
+    heatmap|calendar) cmd_heatmap ;;
+    chart)     cmd_chart ;;
+    punchcard) cmd_punchcard ;;
     matrix)
         [[ -z "$MATRIX_BY" ]] && { echo "$PROG: matrix requires --by provider,model,…" >&2; exit 1; }
         matarr=()
         IFS=',' read -r -a matarr <<<"$MATRIX_BY"
         for d in "${matarr[@]}"; do
             case "$d" in
-                model|provider|agent|project|session|day|week|month) : ;;
-                *) echo "$PROG: unknown dimension '$d' (choose from: model provider agent project session day week month)" >&2; exit 1 ;;
+                model|provider|agent|project|session|day|week|month|hour|dow) : ;;
+                *) echo "$PROG: unknown dimension '$d' (choose from: model provider agent project session day week month hour dow)" >&2; exit 1 ;;
             esac
         done
         SORT="${SORT:-cost}"

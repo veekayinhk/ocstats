@@ -30,9 +30,15 @@ import (
 )
 
 const (
-	version      = "1.0.0"
+	version      = "1.2.0"
 	prog         = "ocstats"
 	modelsDevURL = "https://models.dev/api.json"
+)
+
+var (
+	dowByWeekday = [7]string{"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}
+	dowOrder     = [7]string{"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}
+	monthAbbr    = [13]string{"", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
 )
 
 // ---------------------------------------------------------------------------
@@ -45,6 +51,7 @@ func bold(s string) string   { return esc("1", s) }
 func dim(s string) string    { return esc("2", s) }
 func yellow(s string) string { return esc("33", s) }
 func green(s string) string  { return esc("32", s) }
+func blue(s string) string   { return esc("34", s) }
 func cyan(s string) string   { return esc("36", s) }
 func white(s string) string  { return esc("37", s) }
 
@@ -68,6 +75,8 @@ type Row struct {
 	Day       string
 	Week      string
 	Month     string
+	Hour      string
+	Dow       string
 	Provider  string
 	Model     string
 	Agent     string
@@ -271,6 +280,8 @@ func fetchRows(db *sql.DB, flt *Filters) ([]Row, error) {
 			Day:       t.Format("2006-01-02"),
 			Week:      mondayStart(t).Format("2006-01-02"),
 			Month:     t.Format("2006-01"),
+			Hour:      t.Format("15"),
+			Dow:       dowByWeekday[int(t.Weekday())],
 			Provider:  d.Model.ProviderID,
 			Model:     d.Model.ID,
 			Agent:     d.Agent,
@@ -533,16 +544,22 @@ ORDER BY sm.time_created`
 	return out, rows.Err()
 }
 
-func attributePrompts(prompts []Prompt, rows []Row) {
+func attributePrompts(prompts []Prompt, rows []Row, flt *Filters) []Prompt {
 	bySession := map[string][]*Row{}
 	for i := range rows {
 		bySession[rows[i].Session] = append(bySession[rows[i].Session], &rows[i])
 	}
+	hasMPA := flt != nil && (flt.Model != "" || flt.Provider != "" || flt.Agent != "")
+	var kept []Prompt
 	for i := range prompts {
-		p := &prompts[i]
+		p := prompts[i]
 		msgs := bySession[p.Session]
 		if len(msgs) == 0 {
+			if hasMPA {
+				continue
+			}
 			p.Provider, p.Model, p.Agent, p.Project = "unknown", "unknown", "unknown", "(none)"
+			kept = append(kept, p)
 			continue
 		}
 		ref := msgs[len(msgs)-1]
@@ -553,14 +570,16 @@ func attributePrompts(prompts []Prompt, rows []Row) {
 			}
 		}
 		p.Provider, p.Model, p.Agent, p.Project = ref.Provider, ref.Model, ref.Agent, ref.Project
+		kept = append(kept, p)
 	}
+	return kept
 }
 
 // ---------------------------------------------------------------------------
 // aggregation
 // ---------------------------------------------------------------------------
 
-var dimensions = []string{"model", "provider", "agent", "project", "session", "day", "week", "month"}
+var dimensions = []string{"model", "provider", "agent", "project", "session", "day", "week", "month", "hour", "dow"}
 
 func dimValue(r *Row, dim string) string {
 	switch dim {
@@ -580,6 +599,10 @@ func dimValue(r *Row, dim string) string {
 		return r.Week
 	case "month":
 		return r.Month
+	case "hour":
+		return r.Hour
+	case "dow":
+		return r.Dow
 	}
 	return "?"
 }
@@ -607,7 +630,7 @@ func groupRows(rows []Row, dims []string, p *pricing, prompts []Prompt) []*Group
 	for i := range prompts {
 		parts := make([]string, len(dims))
 		for j, d := range dims {
-			if d == "day" || d == "week" || d == "month" {
+			if d == "day" || d == "week" || d == "month" || d == "hour" || d == "dow" {
 				parts[j] = timeDim(prompts[i].TS, d)
 			} else {
 				parts[j] = promptValue(&prompts[i], d)
@@ -669,6 +692,10 @@ func timeDim(t time.Time, dim string) string {
 		return mondayStart(t).Format("2006-01-02")
 	case "month":
 		return t.Format("2006-01")
+	case "hour":
+		return t.Format("15")
+	case "dow":
+		return dowByWeekday[int(t.Weekday())]
 	}
 	return "?"
 }
@@ -931,6 +958,9 @@ type options struct {
 	by             string
 	rows           string
 	cols           string
+	period         string
+	weeks          int
+	split          bool
 	metric         string
 	refresh        bool
 	promptRows     []Prompt
@@ -948,12 +978,13 @@ var mdMode = false // render tables as markdown
 var commands = map[string]bool{
 	"summary": true, "models": true, "providers": true, "agents": true,
 	"projects": true, "sessions": true, "daily": true, "weekly": true,
-	"monthly": true, "matrix": true, "pivot": true, "prices": true,
+	"monthly": true, "matrix": true, "pivot": true, "heatmap": true,
+	"calendar": true, "chart": true, "punchcard": true, "prices": true,
 }
 
 func parseArgs(argv []string) (*options, error) {
 	o := &options{command: "", limit: 25, rows: "project", cols: "day",
-		metric: "", monthlyBudget: -1}
+		period: "day", metric: "", monthlyBudget: -1}
 	var rest []string
 	for _, a := range argv {
 		if commands[a] && o.command == "" {
@@ -1004,6 +1035,16 @@ func parseArgs(argv []string) (*options, error) {
 			o.rows = next()
 		case "--cols":
 			o.cols = next()
+		case "--period":
+			o.period = next()
+		case "--weeks":
+			v, err := strconv.Atoi(next())
+			if err != nil {
+				return nil, fmt.Errorf("bad --weeks")
+			}
+			o.weeks = v
+		case "--split":
+			o.split = true
 		case "--metric":
 			o.metric = next()
 		case "--json":
@@ -1080,10 +1121,18 @@ commands:
   monthly   aggregate per month (time series)
   matrix    aggregate by ANY dimension combination (--by provider,month, …)
   pivot     cross-tab heat-map grid (--rows project --cols day)
+  heatmap   GitHub-style contribution calendar (--by model/provider, --split)
+  chart     stacked ASCII/Unicode bar chart over time (--period, --by)
+  punchcard 7×24 (Mon–Sun × 00–23h) circadian activity grid
   prices    show resolved pricing table (--refresh re-fetches models.dev)
 
-aggregation examples:
+aggregation & chart examples:
   ocstats-bin                                summary of everything
+  ocstats-bin heatmap                        GitHub-style contribution calendar
+  ocstats-bin heatmap --by model             calendar color-coded by dominant model
+  ocstats-bin heatmap --by provider --split  stacked mini-calendars per provider
+  ocstats-bin chart --period day --by model  stacked daily bar chart by model
+  ocstats-bin punchcard --by model           7×24 circadian grid by model
   ocstats-bin models                         per provider × model
   ocstats-bin providers --since 30d          last 30 days per provider
   ocstats-bin daily                          per-day time series
@@ -1095,8 +1144,8 @@ aggregation examples:
   ocstats-bin sessions --top 5               5 most expensive sessions
   ocstats-bin summary --monthly-budget 50    spend vs $50 monthly budget
 
-dimensions for matrix --by / pivot --rows / --cols:
-  model, provider, agent, project, session, day, week, month
+dimensions for matrix --by / pivot --rows / --cols / heatmap --by / chart --by:
+  model, provider, agent, project, session, day, week, month, hour, dow
   (comma-separate any combination, e.g. --by project,day,provider)
 
 filters: --since --until (YYYY-MM-DD | 30d)  --model --provider --agent --project --session
@@ -1194,8 +1243,7 @@ func run(argv []string) error {
 	if err != nil {
 		return err
 	}
-	attributePrompts(prompts, rows)
-	o.promptRows = prompts
+	o.promptRows = attributePrompts(prompts, rows, flt)
 	if o.prev != nil {
 		pflt := &Filters{Since: o.compare, Until: o.compare, Model: o.model,
 			Provider: o.provider, Agent: o.agent, Project: o.project,
@@ -1208,8 +1256,8 @@ func run(argv []string) error {
 		if err != nil {
 			return err
 		}
-		attributePrompts(pPrompts, pRows)
-		o.prev.rows, o.prev.prompts = pRows, pPrompts
+		o.prev.rows = pRows
+		o.prev.prompts = attributePrompts(pPrompts, pRows, pflt)
 	}
 
 	switch o.command {
@@ -1233,6 +1281,12 @@ func run(argv []string) error {
 		return groupReport(os.Stdout, rows, flt, p, o, []string{"month"}, "Usage by month")
 	case "pivot":
 		return cmdPivot(os.Stdout, rows, flt, p, o)
+	case "heatmap", "calendar":
+		return cmdHeatmap(os.Stdout, rows, flt, p, o)
+	case "chart":
+		return cmdChart(os.Stdout, rows, flt, p, o)
+	case "punchcard":
+		return cmdPunchcard(os.Stdout, rows, flt, p, o)
 	case "matrix":
 		dims := []string{}
 		for _, d := range strings.Split(o.by, ",") {
@@ -2184,3 +2238,841 @@ func firstNonEmpty(a, b string) string {
 
 func red(s string) string     { return esc("31", s) }
 func magenta(s string) string { return esc("35", s) }
+
+// ---------------------------------------------------------------------------
+// heatmap / calendar, chart, punchcard
+// ---------------------------------------------------------------------------
+
+type seriesStyle struct {
+	color func(string) string
+	block string
+	sym   string
+}
+
+var seriesPalette = []seriesStyle{
+	{cyan, "█", "@"},
+	{magenta, "▓", "#"},
+	{yellow, "▒", "+"},
+	{green, "░", "*"},
+	{blue, "▪", "="},
+}
+
+var otherSeriesStyle = seriesStyle{white, "▫", "~"}
+
+func heatBlock(v, mx float64) string {
+	if v <= 0 || mx <= 0 {
+		return "·"
+	}
+	q := v / mx
+	switch {
+	case q > 0.75:
+		return "█"
+	case q > 0.50:
+		return "▓"
+	case q > 0.25:
+		return "▒"
+	default:
+		return "░"
+	}
+}
+
+func colorHeatBlock(v, mx float64, cfn func(string) string, asym string) string {
+	if v <= 0 || mx <= 0 {
+		return dim("·")
+	}
+	b := heatBlock(v, mx)
+	q := v / mx
+	if cfn != nil {
+		if !useColor && asym != "" {
+			return asym
+		}
+		if q > 0.75 {
+			return bold(cfn(b))
+		}
+		return cfn(b)
+	}
+	switch {
+	case q > 0.75:
+		return bold(cyan("█"))
+	case q > 0.50:
+		return cyan("▓")
+	case q > 0.25:
+		return green("▒")
+	default:
+		return green("░")
+	}
+}
+
+func validDim(d string) bool {
+	for _, v := range dimensions {
+		if d == v {
+			return true
+		}
+	}
+	return false
+}
+
+func cmdHeatmap(w io.Writer, rows []Row, flt *Filters, p *pricing, o *options) error {
+	metric := firstNonEmpty(o.metric, "tokens")
+	pm, ok := pivotMetrics[metric]
+	if !ok {
+		return errors.New("--metric must be one of: tokens in out cache msgs prompts cost")
+	}
+	byDim := strings.TrimSpace(o.by)
+	if byDim != "" && !validDim(byDim) {
+		return fmt.Errorf("unknown --by dimension %q", byDim)
+	}
+	fmtv := func(v float64) string {
+		if pm.money {
+			return money(v)
+		}
+		return tok(int64(math.Round(v)))
+	}
+
+	dayGroups := groupRows(rows, []string{"day"}, p, o.promptRows)
+	if len(dayGroups) == 0 {
+		return errors.New("no activity matched the current filters")
+	}
+	dayVal := map[string]float64{}
+	var allDays []string
+	var grand float64
+	for _, g := range dayGroups {
+		v := pm.value(g)
+		dayVal[g.Key[0]] = v
+		allDays = append(allDays, g.Key[0])
+		grand += v
+	}
+	sort.Strings(allDays)
+
+	minDT, _ := time.ParseInLocation("2006-01-02", allDays[0], time.Local)
+	maxDT, _ := time.ParseInLocation("2006-01-02", allDays[len(allDays)-1], time.Local)
+	firstMon := mondayStart(minDT)
+	lastMon := mondayStart(maxDT)
+	numWeeks := int(lastMon.Sub(firstMon).Hours()/(24*7)) + 1
+	if o.weeks > 0 {
+		numWeeks = o.weeks
+		firstMon = lastMon.AddDate(0, 0, -(numWeeks-1)*7)
+	} else if numWeeks < 16 && o.since == "" {
+		numWeeks = 16
+		firstMon = lastMon.AddDate(0, 0, -15*7)
+	} else if numWeeks > 52 {
+		numWeeks = 52
+		firstMon = lastMon.AddDate(0, 0, -51*7)
+	}
+
+	spanDays := int(maxDT.Sub(minDT).Hours()/24) + 1
+	activeDays := 0
+	longestStreak, curStreak, run := 0, 0, 0
+	peakDay := allDays[0]
+	peakVal := -1.0
+	dowTotals := map[string]float64{}
+	for d := minDT; !d.After(maxDT); d = d.AddDate(0, 0, 1) {
+		ds := d.Format("2006-01-02")
+		v := dayVal[ds]
+		if v > 0 {
+			activeDays++
+			run++
+			if run > longestStreak {
+				longestStreak = run
+			}
+		} else {
+			run = 0
+		}
+		if v > peakVal {
+			peakVal = v
+			peakDay = ds
+		}
+		dowTotals[dowByWeekday[int(d.Weekday())]] += v
+	}
+	curStreak = run
+	busiestDow := "Mon"
+	for _, d := range dowOrder {
+		if dowTotals[d] > dowTotals[busiestDow] {
+			busiestDow = d
+		}
+	}
+	mx := peakVal
+	if mx <= 0 {
+		mx = 1
+	}
+
+	byDaySeries := map[string]map[string]float64{}
+	seriesTotals := map[string]float64{}
+	var topSeries []string
+	styleMap := map[string]seriesStyle{}
+	if byDim != "" {
+		sg := groupRows(rows, []string{"day", byDim}, p, o.promptRows)
+		for _, g := range sg {
+			v := pm.value(g)
+			dKey, sKey := g.Key[0], g.Key[1]
+			if byDaySeries[dKey] == nil {
+				byDaySeries[dKey] = map[string]float64{}
+			}
+			byDaySeries[dKey][sKey] += v
+			seriesTotals[sKey] += v
+		}
+		for s := range seriesTotals {
+			topSeries = append(topSeries, s)
+		}
+		sort.Slice(topSeries, func(i, j int) bool { return seriesTotals[topSeries[i]] > seriesTotals[topSeries[j]] })
+		capN := 5
+		if o.split {
+			if o.topN > 0 {
+				capN = o.topN
+			} else if o.limit != 25 && o.limit > 0 {
+				capN = o.limit
+			}
+		}
+		if len(topSeries) > capN {
+			topSeries = topSeries[:capN]
+		}
+		for i, s := range topSeries {
+			styleMap[s] = seriesPalette[i%len(seriesPalette)]
+		}
+	}
+
+	domFor := func(ds string) string {
+		bk := byDaySeries[ds]
+		bestS := ""
+		bestV := -1.0
+		for s, v := range bk {
+			if v > bestV && v > 0 {
+				bestV = v
+				bestS = s
+			}
+		}
+		return bestS
+	}
+
+	if o.jsonOut {
+		var daysOut []map[string]any
+		for _, ds := range allDays {
+			t, _ := time.ParseInLocation("2006-01-02", ds, time.Local)
+			entry := map[string]any{
+				"day": ds, "dow": dowByWeekday[int(t.Weekday())], "value": round6(dayVal[ds]),
+			}
+			if byDim != "" {
+				entry["dominant"] = domFor(ds)
+				entry["breakdown"] = byDaySeries[ds]
+			}
+			daysOut = append(daysOut, entry)
+		}
+		b, _ := json.MarshalIndent(map[string]any{
+			"metric": metric, "by": byDim, "weeks": numWeeks,
+			"stats": map[string]any{
+				"total": round6(grand), "active_days": activeDays, "span_days": spanDays,
+				"longest_streak": longestStreak, "current_streak": curStreak,
+				"peak_day": peakDay, "peak_value": round6(peakVal), "busiest_dow": busiestDow,
+			},
+			"days": daysOut,
+		}, "", "  ")
+		fmt.Fprintln(w, string(b))
+		return nil
+	}
+	if o.csvOut {
+		hdr := "day,dow,week," + metric
+		if byDim != "" {
+			hdr += ",dominant_" + byDim
+		}
+		fmt.Fprintln(w, hdr)
+		for _, ds := range allDays {
+			t, _ := time.ParseInLocation("2006-01-02", ds, time.Local)
+			wk := mondayStart(t).Format("2006-01-02")
+			line := fmt.Sprintf("%s,%s,%s,%.6f", ds, dowByWeekday[int(t.Weekday())], wk, dayVal[ds])
+			if byDim != "" {
+				line += "," + csvQuote(domFor(ds))
+			}
+			fmt.Fprintln(w, line)
+		}
+		return nil
+	}
+
+	renderCal := func(lookup map[string]float64, maxV float64, fixed *seriesStyle, useDom bool) {
+		mChars := make([]rune, numWeeks*2)
+		for i := range mChars {
+			mChars[i] = ' '
+		}
+		lastM := -1
+		lastPos := -4
+		for wi := 0; wi < numWeeks; wi++ {
+			wkMon := firstMon.AddDate(0, 0, wi*7)
+			mNum := int(wkMon.Month())
+			for off := 0; off < 7; off++ {
+				cand := wkMon.AddDate(0, 0, off)
+				if cand.Day() == 1 && !cand.After(maxDT) {
+					mNum = int(cand.Month())
+					break
+				}
+			}
+			pos := wi * 2
+			if mNum != lastM && pos-lastPos >= 4 {
+				for ci, r := range monthAbbr[mNum] {
+					if pos+ci < len(mChars) {
+						mChars[pos+ci] = r
+					}
+				}
+				lastM = mNum
+				lastPos = pos
+			}
+		}
+		fmt.Fprintln(w, "       "+dim(strings.TrimRight(string(mChars), " ")))
+		for wdIdx, wdName := range dowOrder {
+			var b strings.Builder
+			b.WriteString("  " + dim(wdName) + "  ")
+			for wi := 0; wi < numWeeks; wi++ {
+				curD := firstMon.AddDate(0, 0, wi*7+wdIdx)
+				if curD.After(maxDT) {
+					b.WriteString("  ")
+					continue
+				}
+				ds := curD.Format("2006-01-02")
+				v := lookup[ds]
+				if fixed != nil {
+					b.WriteString(colorHeatBlock(v, maxV, fixed.color, "") + " ")
+				} else if useDom && v > 0 {
+					st, ok := styleMap[domFor(ds)]
+					if !ok {
+						st = otherSeriesStyle
+					}
+					b.WriteString(colorHeatBlock(v, maxV, st.color, st.sym) + " ")
+				} else {
+					b.WriteString(colorHeatBlock(v, maxV, nil, "") + " ")
+				}
+			}
+			fmt.Fprintln(w, strings.TrimRight(b.String(), " "))
+		}
+	}
+
+	pricingHint(p)
+	title := fmt.Sprintf("%s · GitHub Contribution Calendar (%dw)", pm.label, numWeeks)
+	if byDim != "" {
+		if o.split {
+			title += " · split by " + byDim
+		} else {
+			title += " · dominant " + byDim
+		}
+	}
+	fmt.Fprintln(w)
+	if mdMode {
+		fmt.Fprintf(w, "### %s\n\n```\n\n", title)
+	} else {
+		fmt.Fprintf(w, "  %s  %s\n\n", bold(cyan(title)), dim("· "+flt.Describe()))
+	}
+
+	if byDim != "" && o.split {
+		for i, sName := range topSeries {
+			st := seriesPalette[i%len(seriesPalette)]
+			sDays := map[string]float64{}
+			sMax := 0.0
+			for ds, bk := range byDaySeries {
+				if sv := bk[sName]; sv > 0 {
+					sDays[ds] = sv
+					if sv > sMax {
+						sMax = sv
+					}
+				}
+			}
+			if sMax <= 0 {
+				sMax = 1
+			}
+			sw := st.sym
+			if useColor {
+				sw = st.color(st.block)
+			}
+			sh := 0.0
+			if grand > 0 {
+				sh = seriesTotals[sName] / grand
+			}
+			fmt.Fprintf(w, "  %s %s  %s\n", sw, bold(sName),
+				dim(fmt.Sprintf("%s (%s) · %d active days · peak %s", fmtv(seriesTotals[sName]), pct(sh), len(sDays), fmtv(sMax))))
+			renderCal(sDays, sMax, &st, false)
+			fmt.Fprintln(w)
+		}
+	} else {
+		renderCal(dayVal, mx, nil, byDim != "")
+		fmt.Fprintln(w)
+		fmt.Fprintf(w, "  %s %s 0   %s <25%%   %s 25-50%%   %s 50-75%%   %s >75%% (peak %s)\n",
+			dim("Legend:"), dim("·"),
+			colorHeatBlock(0.15*mx, mx, nil, ""),
+			colorHeatBlock(0.40*mx, mx, nil, ""),
+			colorHeatBlock(0.65*mx, mx, nil, ""),
+			colorHeatBlock(0.90*mx, mx, nil, ""),
+			fmtv(peakVal))
+		if byDim != "" && len(topSeries) > 0 {
+			wins := map[string]int{}
+			for _, ds := range allDays {
+				if dayVal[ds] > 0 {
+					wins[domFor(ds)]++
+				}
+			}
+			var parts []string
+			for _, sName := range topSeries {
+				st := styleMap[sName]
+				sw := st.sym
+				if useColor {
+					sw = st.color("█")
+				}
+				sh := 0.0
+				if grand > 0 {
+					sh = seriesTotals[sName] / grand
+				}
+				parts = append(parts, fmt.Sprintf("%s %s %s", sw, bold(truncate(sName, 22)), dim(fmt.Sprintf("%s (%dd)", pct(sh), wins[sName]))))
+			}
+			fmt.Fprintf(w, "  %s %s\n", dim(strings.ToUpper(byDim[:1])+byDim[1:]+":"), strings.Join(parts, "   "))
+		}
+	}
+	shActive := 0.0
+	if spanDays > 0 {
+		shActive = float64(activeDays) / float64(spanDays)
+	}
+	fmt.Fprintf(w, "  %s  total %s  ·  active %s (%s)  ·  peak %s (%s)  ·  busiest %s  ·  streak %s (best %dd)\n",
+		dim("Stats:"), bold(fmtv(grand)), bold(fmt.Sprintf("%d/%dd", activeDays, spanDays)), pct(shActive),
+		bold(peakDay), fmtv(peakVal), bold(busiestDow), bold(fmt.Sprintf("%dd", curStreak)), longestStreak)
+	if mdMode {
+		fmt.Fprintln(w, "```")
+	}
+	fmt.Fprintln(w)
+	return nil
+}
+
+func cmdChart(w io.Writer, rows []Row, flt *Filters, p *pricing, o *options) error {
+	period := firstNonEmpty(o.period, "day")
+	switch period {
+	case "date", "daily":
+		period = "day"
+	case "weekday":
+		period = "dow"
+	case "hourly":
+		period = "hour"
+	}
+	if period != "day" && period != "week" && period != "month" && period != "hour" && period != "dow" {
+		return errors.New("--period must be one of: day week month hour dow")
+	}
+	byDim := strings.TrimSpace(o.by)
+	if byDim != "" {
+		if !validDim(byDim) {
+			return fmt.Errorf("unknown --by dimension %q", byDim)
+		}
+		if byDim == period {
+			return errors.New("--period and --by must differ")
+		}
+	}
+	metric := firstNonEmpty(o.metric, "tokens")
+	pm, ok := pivotMetrics[metric]
+	if !ok {
+		return errors.New("--metric must be one of: tokens in out cache msgs prompts cost")
+	}
+	fmtv := func(v float64) string {
+		if pm.money {
+			return money(v)
+		}
+		return tok(int64(math.Round(v)))
+	}
+
+	pgroups := groupRows(rows, []string{period}, p, o.promptRows)
+	if len(pgroups) == 0 {
+		return errors.New("no activity matched the current filters")
+	}
+	if period == "dow" {
+		dowRank := map[string]int{"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
+		sort.SliceStable(pgroups, func(i, j int) bool { return dowRank[pgroups[i].Key[0]] < dowRank[pgroups[j].Key[0]] })
+	} else if period == "hour" {
+		sort.SliceStable(pgroups, func(i, j int) bool { return pgroups[i].Key[0] < pgroups[j].Key[0] })
+	} else {
+		sortGroups(pgroups, firstNonEmpty(o.sortBy, "date-desc"))
+	}
+	if o.bottomN > 0 {
+		for i, j := 0, len(pgroups)-1; i < j; i, j = i+1, j-1 {
+			pgroups[i], pgroups[j] = pgroups[j], pgroups[i]
+		}
+	}
+	grand := 0.0
+	for _, g := range pgroups {
+		grand += pm.value(g)
+	}
+	if grand <= 0 {
+		grand = 1
+	}
+	limit := o.limit
+	if o.topN > 0 {
+		limit = o.topN
+	} else if o.bottomN > 0 {
+		limit = o.bottomN
+	}
+	shown := pgroups
+	if limit > 0 && len(shown) > limit {
+		shown = shown[:limit]
+	}
+	mx := 0.0
+	for _, g := range shown {
+		if v := pm.value(g); v > mx {
+			mx = v
+		}
+	}
+	if mx <= 0 {
+		mx = 1
+	}
+
+	byCell := map[string]map[string]float64{}
+	seriesTotals := map[string]float64{}
+	var topSeries []string
+	styleMap := map[string]seriesStyle{}
+	if byDim != "" {
+		sg := groupRows(rows, []string{period, byDim}, p, o.promptRows)
+		for _, g := range sg {
+			v := pm.value(g)
+			pKey, sKey := g.Key[0], g.Key[1]
+			if byCell[pKey] == nil {
+				byCell[pKey] = map[string]float64{}
+			}
+			byCell[pKey][sKey] += v
+			seriesTotals[sKey] += v
+		}
+		for s := range seriesTotals {
+			topSeries = append(topSeries, s)
+		}
+		sort.Slice(topSeries, func(i, j int) bool { return seriesTotals[topSeries[i]] > seriesTotals[topSeries[j]] })
+		if len(topSeries) > 5 {
+			topSeries = topSeries[:5]
+		}
+		for i, s := range topSeries {
+			styleMap[s] = seriesPalette[i%len(seriesPalette)]
+		}
+	}
+
+	if o.jsonOut {
+		var outRows []map[string]any
+		for _, g := range shown {
+			pk := g.Key[0]
+			v := pm.value(g)
+			rec := map[string]any{period: pk, "value": round6(v), "share": round6(v / grand)}
+			if byDim != "" {
+				rec["breakdown"] = byCell[pk]
+			}
+			outRows = append(outRows, rec)
+		}
+		b, _ := json.MarshalIndent(map[string]any{
+			"period": period, "by": byDim, "metric": metric,
+			"grand_total": round6(grand), "rows": outRows,
+		}, "", "  ")
+		fmt.Fprintln(w, string(b))
+		return nil
+	}
+	if o.csvOut {
+		fmt.Fprintf(w, "%s,%s,share\n", period, metric)
+		for _, g := range shown {
+			v := pm.value(g)
+			fmt.Fprintf(w, "%s,%.6f,%.6f\n", csvQuote(g.Key[0]), v, v/grand)
+		}
+		return nil
+	}
+
+	pricingHint(p)
+	barW := 36
+	title := fmt.Sprintf("%s over %s", pm.label, period)
+	if byDim != "" {
+		title += " · stacked by " + byDim
+	}
+	headers := []string{strings.ToUpper(period[:1]) + period[1:], "Chart", pm.label, "Share"}
+	aligns := "llrr"
+	if byDim != "" {
+		headers = append(headers, "Top "+byDim)
+		aligns += "l"
+	}
+
+	var rrows [][]string
+	totShown := 0.0
+	for _, g := range shown {
+		pk := g.Key[0]
+		v := pm.value(g)
+		totShown += v
+		filled := int(math.Round(v / mx * float64(barW)))
+		if v > 0 && filled == 0 {
+			filled = 1
+		}
+		if byDim == "" {
+			q := v / mx
+			cfn := green
+			if q > 0.75 {
+				cfn = func(s string) string { return bold(cyan(s)) }
+			} else if q > 0.40 {
+				cfn = cyan
+			}
+			bStr := cfn(strings.Repeat("█", filled)) + dim(strings.Repeat("░", barW-filled))
+			rrows = append(rrows, []string{bold(pk), bStr, fmtv(v), pct(v / grand)})
+		} else {
+			bk := byCell[pk]
+			type segItem struct {
+				val float64
+				st  seriesStyle
+			}
+			var ordered []segItem
+			othV := v
+			for _, s := range topSeries {
+				sv := bk[s]
+				othV -= sv
+				if sv > 0 {
+					ordered = append(ordered, segItem{sv, styleMap[s]})
+				}
+			}
+			if othV > 0 {
+				ordered = append(ordered, segItem{othV, otherSeriesStyle})
+			}
+			rem := filled
+			var sb strings.Builder
+			for idx, it := range ordered {
+				slen := 0
+				if idx == len(ordered)-1 {
+					slen = rem
+				} else if v > 0 {
+					slen = int(math.Round(it.val / v * float64(filled)))
+					if it.val > 0 && slen == 0 && rem > 0 {
+						slen = 1
+					}
+					if slen > rem {
+						slen = rem
+					}
+				}
+				rem -= slen
+				sb.WriteString(it.st.color(strings.Repeat(it.st.block, slen)))
+			}
+			sb.WriteString(dim(strings.Repeat("·", barW-filled)))
+			domS := "—"
+			domV := -1.0
+			for s, sv := range bk {
+				if sv > domV && sv > 0 {
+					domV = sv
+					domS = s
+				}
+			}
+			domCell := truncate(domS, 18)
+			if v > 0 && domV > 0 {
+				domCell += " " + dim(pct(domV/v))
+			}
+			rrows = append(rrows, []string{bold(pk), sb.String(), fmtv(v), pct(v / grand), domCell})
+		}
+	}
+	foot := []string{bold("TOTAL"), "", bold(white(fmtv(totShown))), bold(pct(totShown / grand))}
+	if byDim != "" {
+		foot = append(foot, "")
+	}
+	note := fmt.Sprintf("metric: %s · peak %s: %s", metric, period, fmtv(mx))
+	if byDim != "" && len(topSeries) > 0 {
+		var leg []string
+		for _, sName := range topSeries {
+			st := styleMap[sName]
+			leg = append(leg, fmt.Sprintf("%s %s (%s)", st.color(strings.Repeat(st.block, 2)), sName, pct(seriesTotals[sName]/grand)))
+		}
+		note = "Legend: " + strings.Join(leg, "   ")
+	}
+	fmt.Fprintln(w)
+	renderTable(w, title, headers, aligns, rrows, [][]string{foot}, note)
+	fmt.Fprintln(w)
+	return nil
+}
+
+func cmdPunchcard(w io.Writer, rows []Row, flt *Filters, p *pricing, o *options) error {
+	metric := firstNonEmpty(o.metric, "tokens")
+	pm, ok := pivotMetrics[metric]
+	if !ok {
+		return errors.New("--metric must be one of: tokens in out cache msgs prompts cost")
+	}
+	byDim := strings.TrimSpace(o.by)
+	if byDim != "" && !validDim(byDim) {
+		return fmt.Errorf("unknown --by dimension %q", byDim)
+	}
+	fmtv := func(v float64) string {
+		if pm.money {
+			return money(v)
+		}
+		return tok(int64(math.Round(v)))
+	}
+
+	hours := make([]string, 24)
+	for h := 0; h < 24; h++ {
+		hours[h] = fmt.Sprintf("%02d", h)
+	}
+	groups := groupRows(rows, []string{"dow", "hour"}, p, o.promptRows)
+	if len(groups) == 0 {
+		return errors.New("no activity matched the current filters")
+	}
+	cell := map[[2]string]float64{}
+	dowTot := map[string]float64{}
+	hrTot := map[string]float64{}
+	grand := 0.0
+	mx := 0.0
+	peakSlot := [2]string{"Mon", "00"}
+	for _, g := range groups {
+		v := pm.value(g)
+		d, h := g.Key[0], g.Key[1]
+		cell[[2]string{d, h}] = v
+		dowTot[d] += v
+		hrTot[h] += v
+		grand += v
+		if v > mx {
+			mx = v
+			peakSlot = [2]string{d, h}
+		}
+	}
+	if grand <= 0 {
+		grand = 1
+	}
+	if mx <= 0 {
+		mx = 1
+	}
+	peakHr := "00"
+	for _, h := range hours {
+		if hrTot[h] > hrTot[peakHr] {
+			peakHr = h
+		}
+	}
+	busiestDow := "Mon"
+	for _, d := range dowOrder {
+		if dowTot[d] > dowTot[busiestDow] {
+			busiestDow = d
+		}
+	}
+
+	bySlot := map[[2]string]map[string]float64{}
+	seriesTotals := map[string]float64{}
+	var topSeries []string
+	styleMap := map[string]seriesStyle{}
+	if byDim != "" {
+		sg := groupRows(rows, []string{"dow", "hour", byDim}, p, o.promptRows)
+		for _, g := range sg {
+			v := pm.value(g)
+			slot := [2]string{g.Key[0], g.Key[1]}
+			sKey := g.Key[2]
+			if bySlot[slot] == nil {
+				bySlot[slot] = map[string]float64{}
+			}
+			bySlot[slot][sKey] += v
+			seriesTotals[sKey] += v
+		}
+		for s := range seriesTotals {
+			topSeries = append(topSeries, s)
+		}
+		sort.Slice(topSeries, func(i, j int) bool { return seriesTotals[topSeries[i]] > seriesTotals[topSeries[j]] })
+		if len(topSeries) > 5 {
+			topSeries = topSeries[:5]
+		}
+		for i, s := range topSeries {
+			styleMap[s] = seriesPalette[i%len(seriesPalette)]
+		}
+	}
+	slotDom := func(d, h string) string {
+		bk := bySlot[[2]string{d, h}]
+		bestS := ""
+		bestV := -1.0
+		for s, v := range bk {
+			if v > bestV && v > 0 {
+				bestV = v
+				bestS = s
+			}
+		}
+		return bestS
+	}
+
+	if o.jsonOut {
+		var cellsOut []map[string]any
+		for _, d := range dowOrder {
+			for _, h := range hours {
+				if v := cell[[2]string{d, h}]; v > 0 {
+					entry := map[string]any{"dow": d, "hour": h, "value": round6(v)}
+					if byDim != "" {
+						entry["dominant"] = slotDom(d, h)
+					}
+					cellsOut = append(cellsOut, entry)
+				}
+			}
+		}
+		b, _ := json.MarshalIndent(map[string]any{
+			"metric": metric, "by": byDim, "grand_total": round6(grand),
+			"peak_hour": peakHr + ":00", "peak_slot": peakSlot[0] + " " + peakSlot[1] + ":00",
+			"busiest_dow": busiestDow, "cells": cellsOut,
+		}, "", "  ")
+		fmt.Fprintln(w, string(b))
+		return nil
+	}
+	if o.csvOut {
+		fmt.Fprintln(w, "dow,"+strings.Join(hours, ",")+",TOTAL")
+		for _, d := range dowOrder {
+			var parts []string
+			parts = append(parts, d)
+			for _, h := range hours {
+				parts = append(parts, fmt.Sprintf("%.6f", cell[[2]string{d, h}]))
+			}
+			parts = append(parts, fmt.Sprintf("%.6f", dowTot[d]))
+			fmt.Fprintln(w, strings.Join(parts, ","))
+		}
+		return nil
+	}
+
+	pricingHint(p)
+	title := pm.label + " · 7×24 Activity Punchcard"
+	if byDim != "" {
+		title += " · dominant " + byDim
+	}
+	fmt.Fprintln(w)
+	if mdMode {
+		fmt.Fprintf(w, "### %s\n\n```\n\n", title)
+	} else {
+		fmt.Fprintf(w, "  %s  %s\n\n", bold(cyan(title)), dim("· "+flt.Describe()))
+	}
+
+	totW := len(fmtv(grand))
+	if totW < 10 {
+		totW = 10
+	}
+	hdrHours := strings.Join(hours, " ")
+	fmt.Fprintf(w, "       %s │ %*s │ Share\n", bold(hdrHours), totW, "Total")
+	sep := "  ─────┼" + strings.Repeat("─", len(hdrHours)+2) + "┼" + strings.Repeat("─", totW+2) + "┼───────"
+	fmt.Fprintln(w, sep)
+	activeSlots := 0
+	for _, d := range dowOrder {
+		var rowCells []string
+		for _, h := range hours {
+			v := cell[[2]string{d, h}]
+			if v > 0 {
+				activeSlots++
+			}
+			var ch string
+			if byDim != "" && v > 0 {
+				st, ok := styleMap[slotDom(d, h)]
+				if !ok {
+					st = otherSeriesStyle
+				}
+				ch = colorHeatBlock(v, mx, st.color, st.sym)
+			} else {
+				ch = colorHeatBlock(v, mx, nil, "")
+			}
+			rowCells = append(rowCells, ch+" ")
+		}
+		dt := dowTot[d]
+		fmt.Fprintf(w, "  %s  │ %s│ %*s │ %5s\n",
+			bold(d), strings.Join(rowCells, " "), totW, fmtv(dt), pct(dt/grand))
+	}
+	fmt.Fprintln(w, sep)
+	fmt.Fprintln(w)
+	if byDim != "" && len(topSeries) > 0 {
+		var parts []string
+		for _, sName := range topSeries {
+			st := styleMap[sName]
+			sw := st.sym
+			if useColor {
+				sw = st.color("█")
+			}
+			parts = append(parts, fmt.Sprintf("%s %s (%s)", sw, bold(truncate(sName, 22)), pct(seriesTotals[sName]/grand)))
+		}
+		fmt.Fprintf(w, "  %s %s\n", dim(strings.ToUpper(byDim[:1])+byDim[1:]+":"), strings.Join(parts, "   "))
+	}
+	fmt.Fprintf(w, "  %s  peak hour %s (%s)  ·  peak slot %s (%s)  ·  busiest day %s  ·  active slots %s\n",
+		dim("Stats:"), bold(peakHr+":00"), fmtv(hrTot[peakHr]),
+		bold(peakSlot[0]+" "+peakSlot[1]+":00"), fmtv(cell[peakSlot]),
+		bold(busiestDow), bold(fmt.Sprintf("%d/168", activeSlots)))
+	if mdMode {
+		fmt.Fprintln(w, "```")
+	}
+	fmt.Fprintln(w)
+	return nil
+}

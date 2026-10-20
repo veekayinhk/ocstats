@@ -36,6 +36,8 @@ jobs:
                      "sessions" "daily" "weekly" "monthly" "prices" \
                      "matrix --by provider,month" \
                      "pivot --rows project --cols day" \
+                     "heatmap" "heatmap --by model" "heatmap --by provider --split" \
+                     "chart --period day --by model" "punchcard --by provider" \
                      "models --details --csv" "providers --md" \
                      "providers --top 2" "providers --bottom 2" \
                      "providers --min-share 1" "summary --monthly-budget 50" \
@@ -71,6 +73,10 @@ jobs:
           OCSTATS_DB=tests/fixture.db ./ocstats-bin summary --json | jq -e '.totals.messages >= 0' > /dev/null
           OCSTATS_DB=tests/fixture.db ./ocstats-bin models --csv > /dev/null
           OCSTATS_DB=tests/fixture.db ./ocstats-bin pivot --rows project --cols day > /dev/null
+          OCSTATS_DB=tests/fixture.db ./ocstats-bin heatmap --by model > /dev/null
+          OCSTATS_DB=tests/fixture.db ./ocstats-bin heatmap --by provider --split > /dev/null
+          OCSTATS_DB=tests/fixture.db ./ocstats-bin chart --period day --by model > /dev/null
+          OCSTATS_DB=tests/fixture.db ./ocstats-bin punchcard --by provider > /dev/null
           # weekly buckets must start on Monday (parity with python/bash)
           OCSTATS_DB=tests/fixture.db ./ocstats-bin weekly --csv | tail -n +2 | cut -d, -f1 \
             | while read -r w; do

@@ -91,6 +91,9 @@ make install          # symlinks ocstats + ocstats.sh into ~/.local/bin
 
 ```
 ocstats                     # summary dashboard (default command)
+ocstats heatmap             # GitHub-style contribution calendar (alias: calendar)
+ocstats chart               # stacked ASCII/Unicode bar chart over time
+ocstats punchcard           # 7×24 (Mon–Sun × 00–23h) circadian activity grid
 ocstats models              # per provider × model
 ocstats providers           # per provider
 ocstats agents              # per agent (build/plan/explore/…)
@@ -103,9 +106,83 @@ ocstats pivot --rows project --cols day       # cross-tab grid with heat shading
 ocstats prices [--refresh]  # resolved pricing table; --refresh re-fetches
 ```
 
-Dimensions for `matrix --by`, `pivot --rows/--cols`: `model provider agent
-project session day week month` — combine freely (`month,model`,
-`provider,agent`, projects-per-day, …).
+Dimensions for `matrix --by`, `pivot --rows/--cols`, `heatmap --by`, `chart --by`:
+`model provider agent project session day week month hour dow` — combine freely
+(`month,model`, `provider,agent`, projects-per-day, …).
+
+### GitHub-style contribution calendar (`heatmap` / `calendar`)
+
+```sh
+ocstats heatmap                                # overall daily contribution graph
+ocstats heatmap --by model                     # color-coded by each day's dominant model
+ocstats heatmap --by provider --split --top 3  # stacked mini-calendars per provider
+ocstats heatmap --metric cost --weeks 26       # 26-week spend calendar
+```
+
+```
+  Tokens · GitHub Contribution Calendar (16w)  · all time
+
+       Jul     Aug       Sep     Oct
+  Mon  · · · · · · · · · · · · · · █ ·
+  Tue  · · · · · · · · · · · · · · ▓ ▒
+  Wed  · · · · · · · · · · · · · · · ▒
+  Thu  · · · · · · · · · · · · · · ░ ▒
+  Fri  · · · · · · · · · · · · · ▒ ▒ ▒
+  Sat  · · · · · · · · · · · · · · ·
+  Sun  · · · · · · · · · · · · · · ▓
+
+  Legend: · 0   ░ <25%   ▒ 25-50%   ▓ 50-75%   █ >75% (peak 806,987)
+  Stats:  total 3,567,539  ·  active 10/15d (66.7%)  ·  peak 2026-10-05 (806,987)  ·  busiest Tue  ·  streak 4d (best 4d)
+```
+
+### Stacked time-series bar chart (`chart`)
+
+```sh
+ocstats chart --period day --by model          # daily bars stacked by model
+ocstats chart --period week --by provider      # weekly bars stacked by provider
+ocstats chart --period hour --by agent         # hourly profile stacked by agent
+```
+
+```
+Tokens over day · stacked by model
+╭────────────┬──────────────────────────────────────────────────┬───────────┬───────┬─────────────────────╮
+│ Day        │ Chart                                            │    Tokens │ Share │ Top model           │
+├────────────┼──────────────────────────────────────────────────┼───────────┼───────┼─────────────────────┤
+│ 2026-10-16 │ ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓························ │   244,750 │  6.9% │ llama-4-70b 100.0%  │
+│ 2026-10-15 │ ███████████████████████████····················· │   265,558 │  7.4% │ acme-fast 100.0%    │
+│ 2026-10-14 │ ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒·········· │   380,751 │ 10.7% │ private-model 62.8% │
+│ 2026-10-13 │ ███████████████████████························· │   229,889 │  6.4% │ acme-fast 100.0%    │
+│ 2026-10-11 │ ████████████████████████████████████████████████ │   479,846 │ 13.5% │ acme-fast 100.0%    │
+╞════════════╪══════════════════════════════════════════════════╪═══════════╪═══════╪═════════════════════╡
+│ TOTAL      │                                                  │ 1,600,794 │ 44.9% │                     │
+╰────────────┴──────────────────────────────────────────────────┴───────────┴───────┴─────────────────────╯
+  Legend: ██ acme-fast (50.3%)   ▓▓ llama-4-70b (27.1%)   ▒▒ private-model (15.8%)   ░░ acme-pro (6.8%)
+```
+
+### 7×24 circadian activity grid (`punchcard`)
+
+```sh
+ocstats punchcard                              # Mon–Sun × 00–23h density grid
+ocstats punchcard --by model                   # color-code each hour slot by dominant model
+```
+
+```
+  Tokens · 7×24 Activity Punchcard  · all time
+
+       00 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17 18 19 20 21 22 23 │      Total │ Share
+  ─────┼─────────────────────────────────────────────────────────────────────────┼────────────┼───────
+  Mon  │ ·  ░  █  ▓  ·  ·  ░  ▓  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  · │    806,987 │ 22.6%
+  Tue  │ ·  ▒  ▒  ·  ·  ▒  ▒  ·  ·  ░  ▓  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  · │    809,340 │ 22.7%
+  Wed  │ ·  ·  ·  ·  ░  ▓  ·  ·  ·  ·  ·  ·  ░  ▒  ·  ·  ·  ·  ·  ·  ·  ·  ·  · │    380,751 │ 10.7%
+  Thu  │ ·  ░  ░  ▓  ░  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  · │    371,396 │ 10.4%
+  Fri  │ ·  ▒  ▒  ·  ·  ░  ▓  ░  ·  ▓  ░  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  · │    719,219 │ 20.2%
+  Sat  │ ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  · │          0 │  0.0%
+  Sun  │ ·  ▒  ·  ·  ·  ░  ░  ▒  ░  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  · │    479,846 │ 13.5%
+  ─────┼─────────────────────────────────────────────────────────────────────────┼────────────┼───────
+  Mix  │ ▁  ▆  █  ▅  ▂  ▆  ▆  ▅  ▁  ▄  ▄  ▁  ▁  ▂  ▁  ▁  ▁  ▁  ▁  ▁  ▁  ▁  ▁  ▁ │  3,567,539 │  100%
+
+  Stats:  peak hour 02:00 (647,119)  ·  peak slot Mon 02:00 (350,199)  ·  busiest day Tue  ·  active slots 31/168
+```
 
 ### Daily usage by model
 

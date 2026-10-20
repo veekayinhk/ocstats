@@ -169,6 +169,36 @@ timeout 90 "$SH" summary --monthly-budget 50 --no-color --since "$SINCE" >"$bud_
     && ok "bash budget block renders" || bad "bash budget missing"
 rm -f "$bud_tmp"
 
+# filtered prompt attribution: --provider filter preserves attributed prompts
+fp_py=$("$PY" summary --provider acme-cloud --json --since "$SINCE" | jq -r '.totals.prompts')
+fp_sh=$("$SH" summary --provider acme-cloud --json --since "$SINCE" 2>/dev/null | jq -r '.totals.prompts')
+[[ "$fp_py" -gt 0 && "$fp_py" == "$fp_sh" ]] \
+    && ok "filtered prompts attributed (python=$fp_py == bash=$fp_sh)" \
+    || bad "filtered prompts: python=$fp_py bash=$fp_sh"
+
+# heatmap, chart, punchcard (ASCII/Unicode visualizations + JSON parity)
+hm_py=$("$PY" heatmap --by model --json --since "$SINCE" | jq -r '.stats.total')
+hm_sh=$("$SH" heatmap --by model --json --since "$SINCE" 2>/dev/null | jq -r '.stats.total')
+awk -v a="$hm_py" -v b="$hm_sh" 'BEGIN{d=a-b;if(d<0)d=-d;exit !(d<1 && a>0)}' \
+    && ok "heatmap --by model JSON total ($hm_py)" \
+    || bad "heatmap total: python=$hm_py bash=$hm_sh"
+"$PY" heatmap --by provider --split --no-color --since "$SINCE" >/dev/null \
+    && timeout 90 "$SH" heatmap --by provider --split --no-color --since "$SINCE" >/dev/null 2>&1 \
+    && ok "heatmap --by provider --split renders (python & bash)" \
+    || bad "heatmap --split failed"
+
+ch_py=$("$PY" chart --period day --by model --json --since "$SINCE" | jq -r '.grand_total')
+ch_sh=$("$SH" chart --period day --by model --json --since "$SINCE" 2>/dev/null | jq -r '.grand_total')
+awk -v a="$ch_py" -v b="$ch_sh" 'BEGIN{d=a-b;if(d<0)d=-d;exit !(d<1)}' \
+    && ok "chart --period day --by model total ($ch_py)" \
+    || bad "chart total: python=$ch_py bash=$ch_sh"
+
+pc_py=$("$PY" punchcard --by provider --json --since "$SINCE" | jq -r '.grand_total')
+pc_sh=$("$SH" punchcard --by provider --json --since "$SINCE" 2>/dev/null | jq -r '.grand_total')
+awk -v a="$pc_py" -v b="$pc_sh" 'BEGIN{d=a-b;if(d<0)d=-d;exit !(d<1)}' \
+    && ok "punchcard --by provider 7x24 grid ($pc_py)" \
+    || bad "punchcard total: python=$pc_py bash=$pc_sh"
+
 # --- go binary (only when built) ---------------------------------------------
 if [[ -x "$GO_BIN" ]]; then
     echo "go binary:"

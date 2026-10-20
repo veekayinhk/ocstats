@@ -3,6 +3,29 @@
 All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.2.0] - 2026-10-20
+
+### Added
+- `heatmap` (alias `calendar`) command: GitHub-style 7×W contribution
+  calendar with quartile intensity blocks (`·░▒▓█`), current & longest
+  streaks, busiest weekday, `--by model|provider|agent|project` dominant
+  series coloring (and ASCII symbols when colorless), and `--split` stacked
+  mini-calendars per top series.
+- `chart` command: stacked horizontal ASCII/Unicode time-series bar chart
+  over `--period day|week|month|hour|dow` segmented by `--by DIM` using
+  distinct block shades (`█▓▒░▪`) + ANSI colors.
+- `punchcard` command: 7×24 (`Mon`–`Sun` × `00`–`23`h) circadian activity
+  grid with hourly mix sparkline, peak hour/slot stats, and optional
+  `--by DIM` dominant-series coloring.
+- `hour` (`00`–`23`) and `dow` (`Mon`–`Sun`) dimensions usable in `matrix`
+  and `pivot` too.
+
+### Fixed
+- Filtering by `--model`, `--provider`, or `--agent` now preserves attributed
+  user prompt counts across all three implementations (previously filtered
+  user rows before turn-attribution in Python, and unattributed prompts in
+  Bash/Go).
+
 ## [1.1.0] - 2026-10-05
 
 ### Added
