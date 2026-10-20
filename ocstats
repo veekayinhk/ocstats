@@ -551,9 +551,12 @@ def term_width(args) -> int:
         return 110
 
 
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
 def disp_len(s: str) -> int:
-    """Display width (CJK-safe enough; box chars are width 1)."""
-    return len(s)
+    """Display width (ANSI-stripped)."""
+    return len(ANSI_RE.sub("", s))
 
 
 def truncate(s: str, width: int) -> str:
@@ -1611,7 +1614,7 @@ def cmd_heatmap(rows, flt, pricing, args):
         return lines
 
     print_hint_pricing(pricing)
-    title = f"{label} · GitHub Contribution Calendar ({num_weeks}w)"
+    title = f"{label} · Calendar Heatmap ({num_weeks}w)"
     if by_dim:
         mode_s = "split by" if getattr(args, "split", False) else "dominant"
         title += f" · {mode_s} {by_dim}"
@@ -1773,7 +1776,7 @@ def cmd_chart(rows, flt, pricing, args):
     title = f"{label} over {period}" + (f" · stacked by {by_dim}" if by_dim else "")
     t = Table(title, width=w)
     t.col(period.capitalize(), "l", priority=10) \
-     .col("Chart", "l", priority=9) \
+     .col("Chart", "l", priority=10) \
      .col(label, "r", priority=10) \
      .col("Share", "r", priority=4)
     if by_dim:
@@ -1786,9 +1789,7 @@ def cmd_chart(rows, flt, pricing, args):
         if v > 0 and filled == 0:
             filled = 1
         if not by_dim:
-            q = v / mx
-            c_fn = C.bold if q > 0.75 else (C.cyan if q > 0.4 else C.green)
-            b_str = c_fn("█" * filled) + C.dim("░" * (bar_w - filled))
+            b_str = C.cyan("█" * filled) + C.dim("░" * (bar_w - filled))
             t.add(C.bold(pk), b_str, fmtv(v), pct(v / grand if grand else 0))
         else:
             bk = by_cell.get(pk, {})
@@ -1808,7 +1809,8 @@ def cmd_chart(rows, flt, pricing, args):
                     slen = min(slen, rem)
                 rem -= slen
                 c_fn, blk, _asym = st
-                segs.append(c_fn(blk * slen))
+                ch = "█" if C.enabled else blk
+                segs.append(c_fn(ch * slen))
             b_str = "".join(segs) + C.dim("·" * (bar_w - filled))
             dom = max(bk, key=lambda s: bk[s]) if bk else "—"
             dom_pct = pct(bk[dom] / v) if bk and v > 0 else ""
@@ -1821,22 +1823,23 @@ def cmd_chart(rows, flt, pricing, args):
     if by_dim:
         foot.append("")
     t.set_footer(*foot)
-
-    if by_dim and top_series:
-        leg = []
-        for s_name in top_series:
-            c_fn, blk, _asym = style_map[s_name]
-            sh = pct(series_totals[s_name] / grand if grand else 0)
-            leg.append(f"{c_fn(blk * 2)} {s_name} ({sh})")
-        if len(series_totals) > len(top_series):
-            c_fn, blk, _asym = OTHER_STYLE
-            leg.append(f"{c_fn(blk * 2)} +{len(series_totals) - len(top_series)} other")
-        t.note = "Legend: " + "   ".join(leg)
-    else:
+    if not by_dim:
         t.note = f"metric: {metric} · peak {period}: {fmtv(mx)}"
 
     print()
     print(t.render())
+    if by_dim and top_series:
+        leg = []
+        for s_name in top_series:
+            c_fn, blk, _asym = style_map[s_name]
+            ch = "█" if C.enabled else blk
+            sh = pct(series_totals[s_name] / grand if grand else 0)
+            leg.append(f"{c_fn(ch * 2)} {C.bold(s_name)} {C.dim(f'({sh})')}")
+        if len(series_totals) > len(top_series):
+            c_fn, blk, _asym = OTHER_STYLE
+            ch = "█" if C.enabled else blk
+            leg.append(f"{c_fn(ch * 2)} {C.dim(f'+{len(series_totals) - len(top_series)} other')}")
+        print("  " + C.dim("Legend: ") + "   ".join(leg))
     print()
 
 
@@ -2037,7 +2040,7 @@ def build_parser():
         epilog=(
             "aggregation & chart examples:\n"
             "  ocstats                                   summary of everything\n"
-            "  ocstats heatmap                           GitHub-style contribution calendar\n"
+            "  ocstats heatmap                           calendar heatmap over weeks\n"
             "  ocstats heatmap --by model                calendar color-coded by dominant model\n"
             "  ocstats heatmap --by provider --split     stacked mini-calendars per provider\n"
             "  ocstats chart --period day --by model     stacked daily bar chart by model\n"
@@ -2105,7 +2108,7 @@ def build_parser():
 
     for hm_name in ("heatmap", "calendar"):
         hm = sub.add_parser(hm_name, parents=[common], conflict_handler="resolve",
-                            help="GitHub-style contribution calendar (--by model/provider, --split)")
+                            help="calendar heatmap (--by model/provider, --split)")
         hm.add_argument("--by", default=None,
                         help="color/split by dimension: model, provider, agent, project, session")
         hm.add_argument("--split", action="store_true",

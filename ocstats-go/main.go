@@ -1121,14 +1121,14 @@ commands:
   monthly   aggregate per month (time series)
   matrix    aggregate by ANY dimension combination (--by provider,month, …)
   pivot     cross-tab heat-map grid (--rows project --cols day)
-  heatmap   GitHub-style contribution calendar (--by model/provider, --split)
+  heatmap   calendar heatmap (--by model/provider, --split)
   chart     stacked ASCII/Unicode bar chart over time (--period, --by)
   punchcard 7×24 (Mon–Sun × 00–23h) circadian activity grid
   prices    show resolved pricing table (--refresh re-fetches models.dev)
 
 aggregation & chart examples:
   ocstats-bin                                summary of everything
-  ocstats-bin heatmap                        GitHub-style contribution calendar
+  ocstats-bin heatmap                        calendar heatmap over weeks
   ocstats-bin heatmap --by model             calendar color-coded by dominant model
   ocstats-bin heatmap --by provider --split  stacked mini-calendars per provider
   ocstats-bin chart --period day --by model  stacked daily bar chart by model
@@ -2544,7 +2544,7 @@ func cmdHeatmap(w io.Writer, rows []Row, flt *Filters, p *pricing, o *options) e
 	}
 
 	pricingHint(p)
-	title := fmt.Sprintf("%s · GitHub Contribution Calendar (%dw)", pm.label, numWeeks)
+	title := fmt.Sprintf("%s · Calendar Heatmap (%dw)", pm.label, numWeeks)
 	if byDim != "" {
 		if o.split {
 			title += " · split by " + byDim
@@ -2791,14 +2791,7 @@ func cmdChart(w io.Writer, rows []Row, flt *Filters, p *pricing, o *options) err
 			filled = 1
 		}
 		if byDim == "" {
-			q := v / mx
-			cfn := green
-			if q > 0.75 {
-				cfn = func(s string) string { return bold(cyan(s)) }
-			} else if q > 0.40 {
-				cfn = cyan
-			}
-			bStr := cfn(strings.Repeat("█", filled)) + dim(strings.Repeat("░", barW-filled))
+			bStr := cyan(strings.Repeat("█", filled)) + dim(strings.Repeat("░", barW-filled))
 			rrows = append(rrows, []string{bold(pk), bStr, fmtv(v), pct(v / grand)})
 		} else {
 			bk := byCell[pk]
@@ -2834,7 +2827,11 @@ func cmdChart(w io.Writer, rows []Row, flt *Filters, p *pricing, o *options) err
 					}
 				}
 				rem -= slen
-				sb.WriteString(it.st.color(strings.Repeat(it.st.block, slen)))
+				ch := it.st.block
+				if useColor {
+					ch = "█"
+				}
+				sb.WriteString(it.st.color(strings.Repeat(ch, slen)))
 			}
 			sb.WriteString(dim(strings.Repeat("·", barW-filled)))
 			domS := "—"
@@ -2856,17 +2853,31 @@ func cmdChart(w io.Writer, rows []Row, flt *Filters, p *pricing, o *options) err
 	if byDim != "" {
 		foot = append(foot, "")
 	}
-	note := fmt.Sprintf("metric: %s · peak %s: %s", metric, period, fmtv(mx))
+	note := ""
+	if byDim == "" {
+		note = fmt.Sprintf("metric: %s · peak %s: %s", metric, period, fmtv(mx))
+	}
+	fmt.Fprintln(w)
+	renderTable(w, title, headers, aligns, rrows, [][]string{foot}, note)
 	if byDim != "" && len(topSeries) > 0 {
 		var leg []string
 		for _, sName := range topSeries {
 			st := styleMap[sName]
-			leg = append(leg, fmt.Sprintf("%s %s (%s)", st.color(strings.Repeat(st.block, 2)), sName, pct(seriesTotals[sName]/grand)))
+			ch := st.block
+			if useColor {
+				ch = "█"
+			}
+			leg = append(leg, fmt.Sprintf("%s %s %s", st.color(strings.Repeat(ch, 2)), bold(sName), dim("("+pct(seriesTotals[sName]/grand)+")")))
 		}
-		note = "Legend: " + strings.Join(leg, "   ")
+		if len(seriesTotals) > len(topSeries) {
+			ch := otherSeriesStyle.block
+			if useColor {
+				ch = "█"
+			}
+			leg = append(leg, fmt.Sprintf("%s %s", otherSeriesStyle.color(strings.Repeat(ch, 2)), dim(fmt.Sprintf("+%d other", len(seriesTotals)-len(topSeries)))))
+		}
+		fmt.Fprintf(w, "  %s%s\n", dim("Legend: "), strings.Join(leg, "   "))
 	}
-	fmt.Fprintln(w)
-	renderTable(w, title, headers, aligns, rrows, [][]string{foot}, note)
 	fmt.Fprintln(w)
 	return nil
 }

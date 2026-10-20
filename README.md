@@ -91,7 +91,7 @@ make install          # symlinks ocstats + ocstats.sh into ~/.local/bin
 
 ```
 ocstats                     # summary dashboard (default command)
-ocstats heatmap             # GitHub-style contribution calendar (alias: calendar)
+ocstats heatmap             # calendar heatmap over weeks (alias: calendar)
 ocstats chart               # stacked ASCII/Unicode bar chart over time
 ocstats punchcard           # 7×24 (Mon–Sun × 00–23h) circadian activity grid
 ocstats models              # per provider × model
@@ -110,17 +110,17 @@ Dimensions for `matrix --by`, `pivot --rows/--cols`, `heatmap --by`, `chart --by
 `model provider agent project session day week month hour dow` — combine freely
 (`month,model`, `provider,agent`, projects-per-day, …).
 
-### GitHub-style contribution calendar (`heatmap` / `calendar`)
+### Calendar heatmap (`heatmap` / `calendar`)
 
 ```sh
-ocstats heatmap                                # overall daily contribution graph
+ocstats heatmap                                # overall daily calendar heatmap
 ocstats heatmap --by model                     # color-coded by each day's dominant model
 ocstats heatmap --by provider --split --top 3  # stacked mini-calendars per provider
 ocstats heatmap --metric cost --weeks 26       # 26-week spend calendar
 ```
 
 ```
-  Tokens · GitHub Contribution Calendar (16w)  · all time
+  Tokens · Calendar Heatmap (16w)  · all time
 
        Jul     Aug       Sep     Oct
   Mon  · · · · · · · · · · · · · · █ ·

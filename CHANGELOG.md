@@ -6,11 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [1.2.0] - 2026-10-20
 
 ### Added
-- `heatmap` (alias `calendar`) command: GitHub-style 7×W contribution
-  calendar with quartile intensity blocks (`·░▒▓█`), current & longest
-  streaks, busiest weekday, `--by model|provider|agent|project` dominant
-  series coloring (and ASCII symbols when colorless), and `--split` stacked
-  mini-calendars per top series.
+- `heatmap` (alias `calendar`) command: 7×W calendar heatmap with quartile
+  intensity blocks (`·░▒▓█`), current & longest streaks, busiest weekday,
+  `--by model|provider|agent|project` dominant-series coloring (and ASCII
+  symbols when colorless), and `--split` stacked mini-calendars per top
+  series.
 - `chart` command: stacked horizontal ASCII/Unicode time-series bar chart
   over `--period day|week|month|hour|dow` segmented by `--by DIM` using
   distinct block shades (`█▓▒░▪`) + ANSI colors.

@@ -13,7 +13,7 @@
 #
 # aggregation & chart examples:
 #   ocstats.sh                                     summary of everything
-#   ocstats.sh heatmap                             GitHub-style contribution calendar
+#   ocstats.sh heatmap                             calendar heatmap over weeks
 #   ocstats.sh heatmap --by model                  calendar color-coded by dominant model
 #   ocstats.sh heatmap --by provider --split       stacked mini-calendars per provider
 #   ocstats.sh chart --period day --by model       stacked daily bar chart by model
@@ -1232,7 +1232,7 @@ cmd_heatmap() {
                 exit 0
             }
 
-            title = sprintf("%s · GitHub Contribution Calendar (%dw)", label, nw)
+            title = sprintf("%s · Calendar Heatmap (%dw)", label, nw)
             if (nd == 2) title = title " · " (split_mode ? "split by " : "dominant ") by_dim
             print ""
             if (md_out) printf "### %s\n\n```\n\n", title
@@ -1394,9 +1394,11 @@ cmd_chart() {
     print_pricing_hint
     local title="$label over $period"
     [[ -n "$by_dim" ]] && title+=" · stacked by $by_dim"
-    local chart_tsv
-    chart_tsv=$(awk -F'\t' -v nd="$nd" -v mc="$mc" -v pdim="$period" -v bdim="$by_dim" \
-        -v metric="$metric" -v label="$label" -v lim="$limit" \
+    local has_color=1
+    [[ "$NO_COLOR_OUT" == "1" || -n "${NO_COLOR:-}" || ! -t 1 || "$RENDER_MD" == "1" ]] && has_color=0
+    local chart_out chart_tsv legend_line=""
+    chart_out=$(awk -F'\t' -v nd="$nd" -v mc="$mc" -v pdim="$period" -v bdim="$by_dim" \
+        -v metric="$metric" -v label="$label" -v lim="$limit" -v has_color="$has_color" \
         -v B="$BOLD" -v D="$DIM" -v G="$GREEN" -v Y="$YELLOW" -v C="$CYAN" \
         -v M="$MAGENTA" -v BL="$BLUE" -v W="$WHITE" -v R="$RESET" \
         "$FMT_FUNCS"'
@@ -1447,8 +1449,7 @@ cmd_chart() {
                 if (nd == 1) {
                     bstr = ""; for (b = 1; b <= filled; b++) bstr = bstr "█"
                     pad = ""; for (b = filled + 1; b <= bar_w; b++) pad = pad "░"
-                    col = (v / mx > 0.75 ? B C : (v / mx > 0.4 ? C : G))
-                    print B pk R "\t" col bstr R D pad R "\t" fmtv(v) "\t" sprintf("%.1f%%", (GRAND>0 ? v/GRAND*100 : 0))
+                    print B pk R "\t" C bstr R D pad R "\t" fmtv(v) "\t" sprintf("%.1f%%", (GRAND>0 ? v/GRAND*100 : 0))
                 } else {
                     rem = filled; bstr = ""; dom_s = "—"; dom_v = -1
                     for (si = 1; si <= NS; si++) {
@@ -1465,10 +1466,12 @@ cmd_chart() {
                         if (slen == 0 && rem > 0) slen = 1
                         if (slen > rem) slen = rem
                         rem -= slen
-                        seg = ""; for (b = 1; b <= slen; b++) seg = seg PBLK[si]
+                        ch = (has_color ? "█" : PBLK[si])
+                        seg = ""; for (b = 1; b <= slen; b++) seg = seg ch
                         bstr = bstr PCOL[si] seg R
                     }
-                    while (rem > 0) { bstr = bstr PCOL[1] PBLK[1] R; rem-- }
+                    ch1 = (has_color ? "█" : PBLK[1])
+                    while (rem > 0) { bstr = bstr PCOL[1] ch1 R; rem-- }
                     pad = ""; for (b = filled + 1; b <= bar_w; b++) pad = pad "·"
                     dpct = (v > 0 && dom_v > 0 ? sprintf(" %.1f%%", dom_v / v * 100) : "")
                     print B pk R "\t" bstr D pad R "\t" fmtv(v) "\t" sprintf("%.1f%%", (GRAND>0 ? v/GRAND*100 : 0)) "\t" dom_s D dpct R
@@ -1477,13 +1480,32 @@ cmd_chart() {
             foot = B "TOTAL" R "\t \t" B W fmtv(tot_sh) R "\t" B sprintf("%.1f%%", (GRAND>0 ? tot_sh/GRAND*100 : 0)) R
             if (nd == 2) foot = foot "\t "
             print foot
+            if (nd == 2 && ntop > 0) {
+                leg = "  " D "Legend: " R
+                for (si = 1; si <= ntop; si++) {
+                    sn = SList[si]; ch = (has_color ? "█" : PBLK[si])
+                    sh = (GRAND > 0 ? STOT[sn] / GRAND * 100 : 0)
+                    leg = leg (si > 1 ? "   " : "") PCOL[si] ch ch R " " B sn R " " D sprintf("(%.1f%%)", sh) R
+                }
+                if (NS > ntop) {
+                    ch = (has_color ? "█" : PBLK[6])
+                    leg = leg "   " PCOL[6] ch ch R " " D sprintf("+%d other", NS - ntop) R
+                }
+                print "##LEGEND"
+                print leg
+            }
         }' <<<"$raw")
+
+    chart_tsv=$(awk '/^##LEGEND$/{exit} {print}' <<<"$chart_out")
+    legend_line=$(awk '/^##LEGEND$/{getline; print}' <<<"$chart_out")
 
     local aligns="llrr"
     [[ -n "$by_dim" ]] && aligns="llrrl"
+    local note=""
+    [[ -z "$by_dim" ]] && note="metric: $metric · period: $period"
     echo
-    printf '%s\n' "$chart_tsv" | render_tsv "$title" "$aligns" 1 \
-       "metric: $metric · period: $period$([[ -n "$by_dim" ]] && echo " · stacked by $by_dim" || echo "")"
+    printf '%s\n' "$chart_tsv" | render_tsv "$title" "$aligns" 1 "$note"
+    [[ -n "$legend_line" ]] && printf '%s\n' "$legend_line"
     echo
 }
 
