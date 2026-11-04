@@ -3,6 +3,28 @@
 All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.2.1] - 2026-11-04
+
+### Changed
+- **SQLite index routing & query optimizations** (Python, Bash, Go):
+  - Route `--session` and `--project` queries through `session_v2` and
+    `session_message_session_type_seq_idx (session_id, type, seq)` (~70× faster
+    on filtered runs).
+  - Route bounded `--since`/`--until` queries through
+    `session_message_time_created_idx` and use sequential scans for unbounded
+    all-time runs instead of random B-tree lookups.
+  - Extract scalar usage fields inside SQLite C (`json_extract`) in a single
+    pass over `session_message` instead of copying and parsing ~243 MB of
+    `"content"` arrays in Python/Go.
+  - Preload `session_v2` metadata, memoize per-row cost estimates and
+    calendar-day date decompositions, and enable read-only SQLite `mmap_size`
+    and memory temp-store PRAGMAs.
+- **Bash (`ocstats.sh`) speedups (~15–35× faster)**:
+  - Resolve all distinct `provider/model` pricing keys in a single batched
+    `jq` invocation instead of spawning per-model `jq` subprocesses.
+  - Replace per-cell subshells in `render_tsv` with a single-pass `awk`
+    boxed-table renderer.
+
 ## [1.2.0] - 2026-10-20
 
 ### Added

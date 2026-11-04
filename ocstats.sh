@@ -36,7 +36,7 @@
 set -euo pipefail
 
 PROG="ocstats"
-VERSION="1.2.0"
+VERSION="1.2.1"
 DB="${OCSTATS_DB:-$HOME/.local/share/opencode/opencode.db}"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ocstats"
 CACHE_FILE="$CACHE_DIR/api.json"
@@ -100,12 +100,11 @@ bar_str() { # bar_str <fraction 0..1> [width]
 
 render_tsv() {
     local title="$1" aligns="$2" footer_sep="${3:-0}" note="${4:-}"
-    local -a hdr rows=()
-    IFS=$'\t' read -r -a hdr
-    mapfile -t rows
-    local ncols=${#hdr[@]}
-
     if ((RENDER_MD)); then
+        local -a hdr rows=()
+        IFS=$'\t' read -r -a hdr
+        mapfile -t rows
+        local ncols=${#hdr[@]}
         local m="" i
         for ((i = 0; i < ncols; i++)); do
             case "${aligns:$i:1}" in r) m+="---:|";; c) m+=":---:|";; *) m+=":---|";; esac
@@ -124,55 +123,60 @@ render_tsv() {
         return 0
     fi
 
-    local -a w=()
-    local i j cell pad
-    for ((i = 0; i < ncols; i++)); do w[$i]=$(wlen "${hdr[$i]}"); done
-    for row in "${rows[@]}"; do
-        IFS=$'\t' read -r -a cells <<<"$row"
-        for ((i = 0; i < ncols; i++)); do
-            pad=$(wlen "${cells[$i]:-}")
-            (( pad > w[$i] )) && w[$i]=$pad
-        done
-    done
-
-    local edge="" mid="" dmid="" bot=""
-    [[ -n "$title" ]] && printf '%s\n' "${BOLD}${CYAN}${title}${RESET}"
-    for ((i = 0; i < ncols; i++)); do
-        edge+="$(rep_char '─' $((w[$i] + 2)))"
-        mid+="$(rep_char '─' $((w[$i] + 2)))"
-        dmid+="$(rep_char '═' $((w[$i] + 2)))"
-        bot+="$(rep_char '─' $((w[$i] + 2)))"
-        if ((i < ncols - 1)); then edge+="┬"; mid+="┼"; dmid+="╪"; bot+="┴"; fi
-    done
-    printf '╭%s╮\n' "$edge"
-
-    local line="│"
-    for ((i = 0; i < ncols; i++)); do
-        cell="${hdr[$i]}"; pad=$((w[$i] - $(wlen "$cell")))
-        if [[ "${aligns:$i:1}" == "r" ]]; then cell="$(rep_char ' ' "$pad")$cell"
-        else cell="$cell$(rep_char ' ' "$pad")"; fi
-        line+=" $cell "; ((i < ncols - 1)) && line+="│"
-    done
-    printf '%s\n' "${BOLD}${line}${RESET}"
-    printf '├%s┤\n' "$mid"
-
-    local nr=${#rows[@]}
-    for ((j = 0; j < nr; j++)); do
-        if ((footer_sep && j == nr - 1 && nr > 1)); then printf '╞%s╡\n' "$dmid"; fi
-        IFS=$'\t' read -r -a cells <<<"${rows[$j]}"
-        line="│"
-        for ((i = 0; i < ncols; i++)); do
-            cell="${cells[$i]:-}"; pad=$((w[$i] - $(wlen "$cell")))
-            if [[ "${aligns:$i:1}" == "r" ]]; then cell="$(rep_char ' ' "$pad")$cell"
-            elif [[ "${aligns:$i:1}" == "c" ]]; then
-                cell="$(rep_char ' ' $((pad / 2)))$cell$(rep_char ' ' $((pad - pad / 2)))"
-            else cell="$cell$(rep_char ' ' "$pad")"; fi
-            line+=" $cell "; ((i < ncols - 1)) && line+="│"
-        done
-        printf '%s\n' "$line"
-    done
-    printf '╰%s╯\n' "$bot"
-    [[ -n "$note" ]] && printf '  %s\n' "${DIM}${note}${RESET}"
+    awk -F'\t' -v title="$title" -v aligns="$aligns" -v fsep="$footer_sep" -v note="$note" \
+        -v B="$BOLD" -v C="$CYAN" -v D="$DIM" -v R="$RESET" '
+        function wlen(s,  p) { p = s; gsub(/\033\[[0-9;]*m/, "", p); return length(p) }
+        function rep(ch, n,  s, k) { s = ""; for (k = 1; k <= n; k++) s = s ch; return s }
+        NR == 1 {
+            ncols = NF
+            for (i = 1; i <= ncols; i++) { HDR[i] = $i; W[i] = wlen($i) }
+            next
+        }
+        {
+            nr++
+            for (i = 1; i <= ncols; i++) {
+                val = (i <= NF ? $i : "")
+                if (val == " ") val = ""
+                CELL[nr, i] = val
+                l = wlen(val)
+                if (l > W[i]) W[i] = l
+            }
+        }
+        END {
+            if (ncols == 0) exit 0
+            if (title != "") print B C title R
+            edge = ""; mid = ""; dmid = ""; bot = ""
+            for (i = 1; i <= ncols; i++) {
+                seg = rep("─", W[i] + 2); dseg = rep("═", W[i] + 2)
+                edge = edge seg (i < ncols ? "┬" : "")
+                mid  = mid  seg (i < ncols ? "┼" : "")
+                dmid = dmid dseg (i < ncols ? "╪" : "")
+                bot  = bot  seg (i < ncols ? "┴" : "")
+            }
+            print "╭" edge "╮"
+            line = "│"
+            for (i = 1; i <= ncols; i++) {
+                c = HDR[i]; pad = W[i] - wlen(c); al = substr(aligns, i, 1)
+                c = (al == "r" ? rep(" ", pad) c : c rep(" ", pad))
+                line = line " " c " " (i < ncols ? "│" : "")
+            }
+            print B line R
+            print "├" mid "┤"
+            for (j = 1; j <= nr; j++) {
+                if (fsep && j == nr && nr > 1) print "╞" dmid "╡"
+                line = "│"
+                for (i = 1; i <= ncols; i++) {
+                    c = CELL[j, i]; pad = W[i] - wlen(c); al = substr(aligns, i, 1)
+                    if (al == "r") c = rep(" ", pad) c
+                    else if (al == "c") { lp = int(pad / 2); c = rep(" ", lp) c rep(" ", pad - lp) }
+                    else c = c rep(" ", pad)
+                    line = line " " c " " (i < ncols ? "│" : "")
+                }
+                print line
+            }
+            print "╰" bot "╯"
+            if (note != "") print "  " D note R
+        }'
     return 0
 }
 
@@ -193,39 +197,58 @@ pipe_row() { # pipe_row <tsv row> [bold] → "| a | b |"
 # pricing (models.dev cache + user overrides, fuzzy provider/model matching)
 # ---------------------------------------------------------------------------
 
-rates_for() { # rates_for <provider> <model> → "pin pout pcr pcw source"
-    local p="$1" m="$2" base leaf out cand
-    base="${m%%@*}"; leaf="${base##*/}"
-    for cand in "$m" "$base" "$leaf"; do
-        if [[ -f "$OVERRIDES_FILE" ]]; then
-            out=$(jq -r --arg p "$p" --arg m "$cand" \
-                '($p + "/" + $m) as $k |
-                 .[$k]? // empty |
-                 select(type == "object") |
-                 [(.input // 0), (.output // 0), (.cache_read // 0), (.cache_write // 0), "override"] | @tsv' \
-                "$OVERRIDES_FILE" 2>/dev/null || true)
-            [[ -n "$out" ]] && { printf '%s\n' "$out"; return; }
-        fi
-        if [[ -f "$CACHE_FILE" ]]; then
-            out=$(jq -r --arg p "$p" --arg m "$cand" \
-                '.[$p].models[$m].cost? // empty |
-                 select(type == "object") |
-                 [(.input // 0), (.output // 0), (.cache_read // 0), (.cache_write // 0), "models.dev"] | @tsv' \
-                "$CACHE_FILE" 2>/dev/null || true)
-            [[ -n "$out" ]] && { printf '%s\n' "$out"; return; }
-        fi
-    done
-    if [[ -f "$CACHE_FILE" ]]; then # global fallback: exact id or leaf under any provider
-        out=$(jq -r --arg m "$m" --arg l "$leaf" '
-            [to_entries[] | .key as $p | (.value.models // {}) |
-             (if has($m) then .[$m] elif has($l) then .[$l] else empty end) as $e |
-             select(($e.cost // null) != null and ($e.cost | type) == "object") |
-             [$e.cost.input // 0, $e.cost.output // 0,
-              $e.cost.cache_read // 0, $e.cost.cache_write // 0, "models.dev~"] | @tsv] | .[0] // empty' \
-            "$CACHE_FILE" 2>/dev/null || true)
-        [[ -n "$out" ]] && { printf '%s\n' "$out"; return; }
+batch_rates_for() { # stdin: "provider/model" lines → stdout: "key\tpin\tpout\tpcr\tpcw\tsrc"
+    local -a jq_args=()
+    if [[ -f "$OVERRIDES_FILE" ]]; then
+        jq_args+=(--slurpfile ov_arr "$OVERRIDES_FILE")
+    else
+        jq_args+=(--argjson ov_arr '[{}]')
     fi
-    printf '%s\n' "0	0	0	0	none"
+    if [[ -f "$CACHE_FILE" ]]; then
+        jq_args+=(--slurpfile doc_arr "$CACHE_FILE")
+    else
+        jq_args+=(--argjson doc_arr '[{}]')
+    fi
+    jq -rn --rawfile keys /dev/stdin "${jq_args[@]}" '
+        ($ov_arr[0] // {}) as $ov |
+        ($doc_arr[0] // {}) as $doc |
+        (reduce ($doc | to_entries | sort_by(.key)[]) as $pe ({};
+            reduce (($pe.value.models // {}) | to_entries[]) as $me (.;
+                if ($me.value.cost? | type) == "object" and (has($me.key) | not)
+                then .[$me.key] = $me.value.cost else . end
+            )
+        )) as $global_models |
+        ($keys | split("\n") | map(select(length > 1 and index("/") != null)))[] |
+        . as $k |
+        ($k | index("/")) as $slash |
+        ($k[0:$slash]) as $p |
+        ($k[($slash+1):]) as $m |
+        (($m | split("@")[0]) // $m) as $base |
+        (($base | split("/")[-1]) // $base) as $leaf |
+        if ($ov[$p + "/" + $m]? | type) == "object" then
+            $ov[$p + "/" + $m] | [$k, (.input//0), (.output//0), (.cache_read//0), (.cache_write//0), "override"]
+        elif ($ov[$p + "/" + $base]? | type) == "object" then
+            $ov[$p + "/" + $base] | [$k, (.input//0), (.output//0), (.cache_read//0), (.cache_write//0), "override"]
+        elif ($ov[$p + "/" + $leaf]? | type) == "object" then
+            $ov[$p + "/" + $leaf] | [$k, (.input//0), (.output//0), (.cache_read//0), (.cache_write//0), "override"]
+        elif ($doc[$p].models[$m].cost? | type) == "object" then
+            $doc[$p].models[$m].cost | [$k, (.input//0), (.output//0), (.cache_read//0), (.cache_write//0), "models.dev"]
+        elif ($doc[$p].models[$base].cost? | type) == "object" then
+            $doc[$p].models[$base].cost | [$k, (.input//0), (.output//0), (.cache_read//0), (.cache_write//0), "models.dev"]
+        elif ($doc[$p].models[$leaf].cost? | type) == "object" then
+            $doc[$p].models[$leaf].cost | [$k, (.input//0), (.output//0), (.cache_read//0), (.cache_write//0), "models.dev"]
+        elif ($global_models[$m]? | type) == "object" then
+            $global_models[$m] | [$k, (.input//0), (.output//0), (.cache_read//0), (.cache_write//0), "models.dev~"]
+        elif ($global_models[$leaf]? | type) == "object" then
+            $global_models[$leaf] | [$k, (.input//0), (.output//0), (.cache_read//0), (.cache_write//0), "models.dev~"]
+        else
+            [$k, 0, 0, 0, 0, "none"]
+        end | @tsv
+    '
+}
+
+rates_for() { # rates_for <provider> <model> → "pin\tpout\tpcr\tpcw\tsource"
+    printf '%s/%s\n' "$1" "$2" | batch_rates_for | cut -f2-
 }
 
 refresh_pricing() {
@@ -310,7 +333,12 @@ compare_windows() { # compare_windows "CUR/PREV" → sets CMP_CUR/CMP_PREV (ms p
 sq() { printf '%s' "${1//\'/\'\'}"; }
 
 dump_where() {
-    local where="sm.type='assistant' AND sm.time_created >= $1 AND sm.time_created < $2"
+    local where="sm.type='assistant'"
+    if (( $1 > 0 || $2 < 99999999999999 )); then
+        where+=" AND sm.time_created >= $1 AND sm.time_created < $2"
+    else
+        where="+sm.type='assistant'"
+    fi
     [[ -n "$F_MODEL" ]]    && where+=" AND json_extract(sm.data,'\$.model.id') LIKE '%$(sq "$F_MODEL")%'"
     [[ -n "$F_PROVIDER" ]] && where+=" AND json_extract(sm.data,'\$.model.providerID') LIKE '%$(sq "$F_PROVIDER")%'"
     [[ -n "$F_AGENT" ]]    && where+=" AND json_extract(sm.data,'\$.agent') LIKE '%$(sq "$F_AGENT")%'"
@@ -320,7 +348,11 @@ dump_where() {
 }
 
 dump_rows() { # dump_rows <lo_ms> <hi_ms> → TSV assistant rows, ts-ordered
+    local join_type="LEFT JOIN"
+    [[ -n "$F_PROJECT" ]] && join_type="INNER JOIN"
     sqlite3 -separator $'\t' "file:$DB?mode=ro" "
+        PRAGMA temp_store = MEMORY;
+        PRAGMA cache_size = -64000;
         SELECT sm.time_created,
                COALESCE(json_extract(sm.data,'\$.model.providerID'),'unknown'),
                COALESCE(json_extract(sm.data,'\$.model.id'),'unknown'),
@@ -334,44 +366,56 @@ dump_rows() { # dump_rows <lo_ms> <hi_ms> → TSV assistant rows, ts-ordered
                COALESCE(json_extract(sm.data,'\$.tokens.cache.write'),0),
                COALESCE(json_extract(sm.data,'\$.cost'),0)
         FROM session_message sm
-        LEFT JOIN session_v2 sv ON sv.id = sm.session_id
+        $join_type session_v2 sv ON sv.id = sm.session_id
         WHERE $(dump_where "$1" "$2")
         ORDER BY sm.time_created;"
 }
 
 dump_prompts() { # dump_prompts <lo_ms> <hi_ms> → TSV user rows, ts-ordered
-    local where="sm.type='user' AND sm.time_created >= $1 AND sm.time_created < $2"
+    local where="sm.type='user'"
+    if (( $1 > 0 || $2 < 99999999999999 )); then
+        where+=" AND sm.time_created >= $1 AND sm.time_created < $2"
+    else
+        where="+sm.type='user'"
+    fi
     [[ -n "$F_SESSION" ]] && where+=" AND sm.session_id LIKE '$(sq "$F_SESSION")%'"
     [[ -n "$F_PROJECT" ]] && where+=" AND sv.directory LIKE '%$(sq "$F_PROJECT")%'"
+    local join_type="LEFT JOIN"
+    [[ -n "$F_PROJECT" ]] && join_type="INNER JOIN"
     sqlite3 -separator $'\t' "file:$DB?mode=ro" "
+        PRAGMA temp_store = MEMORY;
+        PRAGMA cache_size = -64000;
         SELECT sm.time_created, sm.session_id, COALESCE(sv.directory,'')
         FROM session_message sm
-        LEFT JOIN session_v2 sv ON sv.id = sm.session_id
+        $join_type session_v2 sv ON sv.id = sm.session_id
         WHERE $where
         ORDER BY sm.time_created;"
 }
 
 # lazy per-window dump cache: ROWS_FILE/PROMPTS_FILE keyed by "lo hi"
 TMP_RATES=""; TMP_KEYS=""; ROWS_FILE=""; PROMPTS_FILE=""
-declare -A DUMP_CACHE=()
+declare -A DUMP_CACHE=() PROMPTS_CACHE=()
 ensure_data() { # ensure_data <lo_ms> <hi_ms> → sets ROWS_FILE/PROMPTS_FILE
     local key="$1 $2"
     if [[ -n "${DUMP_CACHE[$key]+x}" ]]; then
-        ROWS_FILE="${DUMP_CACHE[$key]}"; return 0
+        ROWS_FILE="${DUMP_CACHE[$key]}"
+        PROMPTS_FILE="${PROMPTS_CACHE[$key]}"
+        return 0
     fi
     if [[ -z "$TMP_RATES" ]]; then
         TMP_RATES=$(mktemp /tmp/ocstats.rates.XXXXXX)
         TMP_KEYS=$(mktemp /tmp/ocstats.keys.XXXXXX)
-        trap 'rm -f "${TMP_RATES:-}" "${TMP_KEYS:-}" ${DUMP_CACHE[@]:-}' EXIT
+        trap 'rm -f "${TMP_RATES:-}" "${TMP_KEYS:-}" ${DUMP_CACHE[@]:-} ${PROMPTS_CACHE[@]:-}' EXIT
     fi
     ROWS_FILE=$(mktemp /tmp/ocstats.rows.XXXXXX)
     PROMPTS_FILE=$(mktemp /tmp/ocstats.prompts.XXXXXX)
     dump_rows "$1" "$2" > "$ROWS_FILE"
     dump_prompts "$1" "$2" > "$PROMPTS_FILE"
     DUMP_CACHE[$key]="$ROWS_FILE"
+    PROMPTS_CACHE[$key]="$PROMPTS_FILE"
 }
 
-ensure_rates() { # build rates for every distinct provider/model across all windows
+ensure_rates() { # build rates for every distinct provider/model across all windows in 1 jq call
     [[ -s "$TMP_RATES" ]] || : > "$TMP_RATES"
     [[ -s "$TMP_KEYS" ]] || : > "$TMP_KEYS"
     local newkeys
@@ -379,10 +423,7 @@ ensure_rates() { # build rates for every distinct provider/model across all wind
                      [[ -s "$f" ]] && awk -F'\t' '{ print $2 "/" $3 }' "$f"
                  done; } | sort -u | comm -23 - "$TMP_KEYS" )
     if [[ -n "$newkeys" ]]; then
-        while IFS= read -r key; do
-            printf '%s\t' "$key"
-            rates_for "${key%%/*}" "${key#*/}"
-        done <<<"$newkeys" >> "$TMP_RATES"
+        printf '%s\n' "$newkeys" | batch_rates_for >> "$TMP_RATES"
         { sort -u "$TMP_KEYS"; printf '%s\n' "$newkeys"; } | sort -u > "$TMP_KEYS.tmp"
         mv "$TMP_KEYS.tmp" "$TMP_KEYS"
     fi
@@ -579,6 +620,8 @@ function hitpct(cr, tin, cw) { return (cr + tin + cw > 0) ? sprintf("%.1f%%", cr
 
 group_report() { # group_report <title> <dims csv> [lo hi]
     local title="$1" dims_csv="$2" glo="${3:-$LO_MS}" ghi="${4:-$HI_MS}"
+    ensure_data "$glo" "$ghi"
+    ensure_rates
     local ndim raw total
     ndim=$(awk -F, '{print NF}' <<<"$dims_csv")
     raw=$(aggregate "$dims_csv" "$glo" "$ghi")
@@ -777,6 +820,8 @@ json_group() { # json_group <dims csv> <limited raw rows>
 # ---------------------------------------------------------------------------
 
 cmd_summary() {
+    ensure_data "$LO_MS" "$HI_MS"
+    ensure_rates
     local day_raw
     day_raw=$(aggregate "day" "$LO_MS" "$HI_MS")
     [[ -z "$day_raw" ]] && { echo "$PROG: no messages matched the current filters" >&2; exit 1; }
@@ -1663,41 +1708,35 @@ cmd_punchcard() {
 cmd_prices() {
     ((REFRESH)) && refresh_pricing
     ensure_data "$LO_MS" "$HI_MS"
-    local key p m out pin pout pcr pcw src
+    ensure_rates
+    local key p m pin pout pcr pcw src
     if ((JSON)); then
-        {
-            printf '{\n  "rows": [\n'
-            local first=1
-            while IFS= read -r key; do
-                p="${key%%/*}"; m="${key#*/}"
-                out=$(rates_for "$p" "$m")
-                IFS=$'\t' read -r pin pout pcr pcw src <<<"$out"
-                ((first)) || printf ',\n'
-                first=0
-                printf '    {"provider": %s, "model": %s, "input": %s, "output": %s, "cache_read": %s, "cache_write": %s, "source": %s}' \
-                    "$(jq -Rn --arg v "$p" '$v')" "$(jq -Rn --arg v "$m" '$v')" \
-                    "$pin" "$pout" "$pcr" "$pcw" "$(jq -Rn --arg v "$src" '$v')"
-            done < <(awk -F'\t' '{ print $2 "/" $3 }' "$ROWS_FILE" | sort -u)
-            printf '\n  ]\n}\n'
-        } | jq .
+        jq -Rn '
+            [inputs | split("\t") | select(length >= 6) |
+             (.[0] | index("/")) as $slash |
+             {provider: .[0][0:$slash], model: .[0][($slash+1):],
+              input: (.[1] | tonumber), output: (.[2] | tonumber),
+              cache_read: (.[3] | tonumber), cache_write: (.[4] | tonumber),
+              source: .[5]}] | {rows: .}
+        ' < <(sort -u "$TMP_RATES")
         return
     fi
     if ((CSV)); then
         printf '%s\n' "provider,model,input,output,cache_read,cache_write,source"
-        while IFS= read -r key; do
+        while IFS=$'\t' read -r key pin pout pcr pcw src; do
+            [[ -z "${key:-}" ]] && continue
             p="${key%%/*}"; m="${key#*/}"
-            IFS=$'\t' read -r pin pout pcr pcw src <<<"$(rates_for "$p" "$m")"
             printf '"%s","%s",%s,%s,%s,%s,"%s"\n' "$p" "$m" "$pin" "$pout" "$pcr" "$pcw" "$src"
-        done < <(awk -F'\t' '{ print $2 "/" $3 }' "$ROWS_FILE" | sort -u)
+        done < <(sort -u "$TMP_RATES")
         return
     fi
     {
         printf '%s\n' $'Provider\tModel\tIn\tOut\tCache R\tCache W\tSource'
-        while IFS= read -r key; do
+        while IFS=$'\t' read -r key pin pout pcr pcw src; do
+            [[ -z "${key:-}" ]] && continue
             p="${key%%/*}"; m="${key#*/}"
-            IFS=$'\t' read -r pin pout pcr pcw src <<<"$(rates_for "$p" "$m")"
             printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$p" "$m" "$pin" "$pout" "$pcr" "$pcw" "$src"
-        done < <(awk -F'\t' '{ print $2 "/" $3 }' "$ROWS_FILE" | sort -u)
+        done < <(sort -u "$TMP_RATES")
     } | render_tsv "Pricing table  ·  \$ per 1M tokens" "llrrrrl" 0 \
         "refresh with: $PROG prices --refresh · overrides: $OVERRIDES_FILE"
     echo

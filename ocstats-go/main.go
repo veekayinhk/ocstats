@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	version      = "1.2.0"
+	version      = "1.2.1"
 	prog         = "ocstats"
 	modelsDevURL = "https://models.dev/api.json"
 )
@@ -160,11 +160,12 @@ func percentile(vals []int64, p float64) float64 {
 // ---------------------------------------------------------------------------
 
 type Filters struct {
-	Since, Until         string
-	Model, Provider      string
-	Agent, Project       string
-	Session              string
-	lo, hi               int64 // epoch ms
+	Since, Until    string
+	Model, Provider string
+	Agent, Project  string
+	Session         string
+	lo, hi          int64 // epoch ms
+	boundedTime     bool
 }
 
 func (f *Filters) Describe() string {
@@ -231,99 +232,166 @@ func dbPath() string {
 	return filepath.Join(home, ".local", "share", "opencode", "opencode.db")
 }
 
-const fetchRowsQuery = `
-SELECT sm.session_id, sm.time_created, sm.data, sv.directory
-FROM session_message AS sm
-LEFT JOIN session_v2 AS sv ON sv.id = sm.session_id
-WHERE sm.type = 'assistant' AND sm.time_created >= ? AND sm.time_created < ?
-ORDER BY sm.time_created`
+type sessionMeta struct {
+	dir     string
+	project string
+}
+
+func loadSessionMap(db *sql.DB) (map[string]sessionMeta, error) {
+	rows, err := db.Query(`SELECT id, COALESCE(directory, '') FROM session_v2`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	m := map[string]sessionMeta{}
+	for rows.Next() {
+		var id, dir string
+		if err := rows.Scan(&id, &dir); err != nil {
+			return nil, err
+		}
+		proj := "(none)"
+		if dir != "" {
+			proj = filepath.Base(dir)
+		}
+		m[id] = sessionMeta{dir: dir, project: proj}
+	}
+	return m, rows.Err()
+}
+
+func buildMessageWhere(mtype string, flt *Filters, smap map[string]sessionMeta) (string, []any, bool) {
+	var conds []string
+	var args []any
+	useSessIdx := false
+	if flt.Session != "" {
+		last := flt.Session[len(flt.Session)-1]
+		hi := flt.Session[:len(flt.Session)-1] + string(last+1)
+		conds = append(conds, "sm.session_id >= ? AND sm.session_id < ?")
+		args = append(args, flt.Session, hi)
+		useSessIdx = true
+	} else if flt.Project != "" && !strings.Contains("(none)", strings.ToLower(flt.Project)) {
+		needle := strings.ToLower(flt.Project)
+		var ph []string
+		for sid, sm := range smap {
+			if strings.Contains(strings.ToLower(sm.project), needle) || strings.Contains(strings.ToLower(sm.dir), needle) {
+				ph = append(ph, "?")
+				args = append(args, sid)
+			}
+		}
+		if len(ph) == 0 {
+			return "", nil, true
+		}
+		conds = append(conds, "sm.session_id IN ("+strings.Join(ph, ",")+")")
+		useSessIdx = true
+	}
+	if useSessIdx {
+		conds = append(conds, "sm.type = ?")
+		args = append(args, mtype)
+		if flt.boundedTime {
+			conds = append(conds, "sm.time_created >= ? AND sm.time_created < ?")
+			args = append(args, flt.lo, flt.hi)
+		}
+	} else if flt.boundedTime {
+		conds = append(conds, "sm.time_created >= ? AND sm.time_created < ? AND sm.type = ?")
+		args = append(args, flt.lo, flt.hi, mtype)
+	} else {
+		conds = append(conds, "+sm.type = ?")
+		args = append(args, mtype)
+	}
+	return strings.Join(conds, " AND "), args, false
+}
 
 func fetchRows(db *sql.DB, flt *Filters) ([]Row, error) {
-	rows, err := db.Query(fetchRowsQuery, flt.lo, flt.hi)
+	smap, err := loadSessionMap(db)
+	if err != nil {
+		return nil, err
+	}
+	where, qargs, empty := buildMessageWhere("assistant", flt, smap)
+	if empty {
+		return nil, nil
+	}
+	q := `
+SELECT sm.session_id,
+       sm.time_created,
+       COALESCE(json_extract(sm.data, '$.model.providerID'), 'unknown'),
+       COALESCE(json_extract(sm.data, '$.model.id'), 'unknown'),
+       COALESCE(json_extract(sm.data, '$.agent'), 'unknown'),
+       COALESCE(json_extract(sm.data, '$.tokens.input'), 0),
+       COALESCE(json_extract(sm.data, '$.tokens.output'), 0),
+       COALESCE(json_extract(sm.data, '$.tokens.reasoning'), 0),
+       COALESCE(json_extract(sm.data, '$.tokens.cache.read'), 0),
+       COALESCE(json_extract(sm.data, '$.tokens.cache.write'), 0),
+       COALESCE(json_extract(sm.data, '$.cost'), 0.0)
+FROM session_message AS sm
+WHERE ` + where + `
+ORDER BY sm.time_created`
+	rows, err := db.Query(q, qargs...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
+	mNeedle := strings.ToLower(flt.Model)
+	pNeedle := strings.ToLower(flt.Provider)
+	aNeedle := strings.ToLower(flt.Agent)
+	projNeedle := strings.ToLower(flt.Project)
+
 	var out []Row
 	for rows.Next() {
-		var sid, data string
-		var ts int64
-		var dir sql.NullString
-		if err := rows.Scan(&sid, &ts, &data, &dir); err != nil {
+		var sid, prov, mdl, agt string
+		var ts, inT, outT, reasT, crT, cwT int64
+		var cost float64
+		if err := rows.Scan(&sid, &ts, &prov, &mdl, &agt, &inT, &outT, &reasT, &crT, &cwT, &cost); err != nil {
 			return nil, err
 		}
-		var d struct {
-			Agent string `json:"agent"`
-			Model struct {
-				ID         string `json:"id"`
-				ProviderID string `json:"providerID"`
-				Variant    string `json:"variant"`
-			} `json:"model"`
-			Tokens struct {
-				Input     int64 `json:"input"`
-				Output    int64 `json:"output"`
-				Reasoning int64 `json:"reasoning"`
-				Cache     struct {
-					Read  int64 `json:"read"`
-					Write int64 `json:"write"`
-				} `json:"cache"`
-			} `json:"tokens"`
-			Cost float64 `json:"cost"`
+		if prov == "" {
+			prov = "unknown"
 		}
-		if err := json.Unmarshal([]byte(data), &d); err != nil {
+		if mdl == "" {
+			mdl = "unknown"
+		}
+		if agt == "" {
+			agt = "unknown"
+		}
+		if mNeedle != "" && !strings.Contains(strings.ToLower(mdl), mNeedle) {
+			continue
+		}
+		if pNeedle != "" && !strings.Contains(strings.ToLower(prov), pNeedle) {
+			continue
+		}
+		if aNeedle != "" && !strings.Contains(strings.ToLower(agt), aNeedle) {
+			continue
+		}
+		sm, ok := smap[sid]
+		if !ok {
+			sm = sessionMeta{dir: "", project: "(none)"}
+		}
+		if projNeedle != "" && !strings.Contains(strings.ToLower(sm.project+"|"+sm.dir), projNeedle) {
+			continue
+		}
+		if flt.Session != "" && !strings.HasPrefix(sid, flt.Session) {
 			continue
 		}
 		t := time.UnixMilli(ts)
-		r := Row{
+		out = append(out, Row{
 			TS:        t,
 			Day:       t.Format("2006-01-02"),
 			Week:      mondayStart(t).Format("2006-01-02"),
 			Month:     t.Format("2006-01"),
 			Hour:      t.Format("15"),
 			Dow:       dowByWeekday[int(t.Weekday())],
-			Provider:  d.Model.ProviderID,
-			Model:     d.Model.ID,
-			Agent:     d.Agent,
+			Provider:  prov,
+			Model:     mdl,
+			Agent:     agt,
 			Session:   sid,
-			Directory: dir.String,
-			In:        d.Tokens.Input,
-			Out:       d.Tokens.Output,
-			Reason:    d.Tokens.Reasoning,
-			CacheR:    d.Tokens.Cache.Read,
-			CacheW:    d.Tokens.Cache.Write,
-			Cost:      d.Cost,
-		}
-		if r.Provider == "" {
-			r.Provider = "unknown"
-		}
-		if r.Model == "" {
-			r.Model = "unknown"
-		}
-		if r.Agent == "" {
-			r.Agent = "unknown"
-		}
-		r.Project = "(none)"
-		if dir.Valid && dir.String != "" {
-			r.Project = filepath.Base(dir.String)
-		}
-		// substring filters
-		if flt.Model != "" && !strings.Contains(strings.ToLower(r.Model), strings.ToLower(flt.Model)) {
-			continue
-		}
-		if flt.Provider != "" && !strings.Contains(strings.ToLower(r.Provider), strings.ToLower(flt.Provider)) {
-			continue
-		}
-		if flt.Agent != "" && !strings.Contains(strings.ToLower(r.Agent), strings.ToLower(flt.Agent)) {
-			continue
-		}
-		if flt.Project != "" && !strings.Contains(strings.ToLower(r.Project+ "|" +r.Directory), strings.ToLower(flt.Project)) {
-			continue
-		}
-		if flt.Session != "" && !strings.HasPrefix(r.Session, flt.Session) {
-			continue
-		}
-		out = append(out, r)
+			Directory: sm.dir,
+			Project:   sm.project,
+			In:        inT,
+			Out:       outT,
+			Reason:    reasT,
+			CacheR:    crT,
+			CacheW:    cwT,
+			Cost:      cost,
+		})
 	}
 	return out, rows.Err()
 }
@@ -515,29 +583,36 @@ func (p *pricing) Estimate(r *Row) float64 {
 // ---------------------------------------------------------------------------
 
 func fetchPrompts(db *sql.DB, flt *Filters) ([]Prompt, error) {
-	q := `
-SELECT sm.session_id, sm.time_created, COALESCE(sv.directory, '')
-FROM session_message AS sm
-LEFT JOIN session_v2 AS sv ON sv.id = sm.session_id
-WHERE sm.type = 'user' AND sm.time_created >= ? AND sm.time_created < ?
-ORDER BY sm.time_created`
-	rows, err := db.Query(q, flt.lo, flt.hi)
+	smap, err := loadSessionMap(db)
+	if err != nil {
+		return nil, err
+	}
+	where, qargs, empty := buildMessageWhere("user", flt, smap)
+	if empty {
+		return nil, nil
+	}
+	q := `SELECT sm.session_id, sm.time_created FROM session_message AS sm WHERE ` + where + ` ORDER BY sm.time_created`
+	rows, err := db.Query(q, qargs...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	projNeedle := strings.ToLower(flt.Project)
 	var out []Prompt
 	for rows.Next() {
-		var sid, dir string
+		var sid string
 		var ts int64
-		if err := rows.Scan(&sid, &ts, &dir); err != nil {
+		if err := rows.Scan(&sid, &ts); err != nil {
 			return nil, err
 		}
 		if flt.Session != "" && !strings.HasPrefix(sid, flt.Session) {
 			continue
 		}
-		if flt.Project != "" && !strings.Contains(strings.ToLower(dir), strings.ToLower(flt.Project)) {
-			continue
+		if projNeedle != "" {
+			sm := smap[sid]
+			if !strings.Contains(strings.ToLower(sm.project+"|"+sm.dir), projNeedle) {
+				continue
+			}
 		}
 		out = append(out, Prompt{TS: time.UnixMilli(ts), Session: sid})
 	}
@@ -1182,6 +1257,7 @@ func run(argv []string) error {
 		Since: o.since, Until: o.until, Model: o.model, Provider: o.provider,
 		Agent: o.agent, Project: o.project, Session: o.session,
 		lo: 0, hi: now.AddDate(1, 0, 0).UnixMilli(),
+		boundedTime: o.since != "" || o.until != "" || o.compare != "",
 	}
 	if o.since != "" {
 		t, err := parseWhen(o.since, "lo", now)
@@ -1226,6 +1302,7 @@ func run(argv []string) error {
 		return err
 	}
 	defer db.Close()
+	_, _ = db.Exec(`PRAGMA temp_store = MEMORY; PRAGMA cache_size = -64000; PRAGMA mmap_size = 536870912;`)
 
 	p, err := loadPricing(o.refresh && o.command == "prices")
 	if err != nil {
@@ -1247,7 +1324,7 @@ func run(argv []string) error {
 	if o.prev != nil {
 		pflt := &Filters{Since: o.compare, Until: o.compare, Model: o.model,
 			Provider: o.provider, Agent: o.agent, Project: o.project,
-			Session: o.session, lo: o.prev.lo, hi: o.prev.hi}
+			Session: o.session, lo: o.prev.lo, hi: o.prev.hi, boundedTime: true}
 		pRows, err := fetchRows(db, pflt)
 		if err != nil {
 			return err

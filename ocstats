@@ -29,7 +29,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 PROG = "ocstats"
 
 DB_ENV = "OCSTATS_DB"
@@ -39,6 +39,7 @@ OVERRIDES_FILE = Path.home() / ".config/ocstats/pricing.json"
 MODELS_DEV_URL = "https://models.dev/api.json"
 
 DOW_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+HOUR_STRS = tuple(f"{h:02d}" for h in range(24))
 DIMENSIONS = ("model", "provider", "agent", "project", "session",
               "day", "week", "month", "hour", "dow")
 DIM_ALIASES = {"date": "day", "daily": "day", "models": "model", "providers": "provider",
@@ -111,109 +112,179 @@ def open_db(path: Path) -> sqlite3.Connection:
                  f"       set ${DB_ENV} to override the path.")
     uri = f"file:{path}?mode=ro"
     try:
-        return sqlite3.connect(uri, uri=True)
+        conn = sqlite3.connect(uri, uri=True)
+        conn.execute("PRAGMA temp_store = MEMORY;")
+        conn.execute("PRAGMA cache_size = -64000;")
+        conn.execute("PRAGMA mmap_size = 536870912;")
+        return conn
     except sqlite3.OperationalError as e:
         sys.exit(f"{PROG}: cannot open database read-only ({path}): {e}")
 
 
-QUERY = """
-SELECT sm.session_id,
-       sm.time_created,
-       sm.data,
-       sv.directory,
-       sv.title,
-       sv.slug
-FROM session_message AS sm
-LEFT JOIN session_v2 AS sv ON sv.id = sm.session_id
-WHERE sm.type = 'assistant'
-  AND sm.time_created >= ?
-  AND sm.time_created <  ?
-"""
+_DAY_META_CACHE: dict[tuple[int, int, int], tuple[str, str, str, str]] = {}
+
+
+def _dt_fields(ts: int):
+    """Fast local-time decomposition with per-calendar-day memoization."""
+    dt = datetime.fromtimestamp(ts / 1000)
+    dkey = (dt.year, dt.month, dt.day)
+    meta = _DAY_META_CACHE.get(dkey)
+    if meta is None:
+        day_s = f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d}"
+        mon_dt = dt - timedelta(days=dt.weekday())
+        wk_s = f"{mon_dt.year:04d}-{mon_dt.month:02d}-{mon_dt.day:02d}"
+        mo_s = f"{dt.year:04d}-{dt.month:02d}"
+        dow_s = DOW_NAMES[dt.weekday()]
+        meta = (day_s, wk_s, mo_s, dow_s)
+        _DAY_META_CACHE[dkey] = meta
+    return dt, meta[0], meta[1], meta[2], HOUR_STRS[dt.hour], meta[3]
+
+
+def _load_sessions_map(conn: sqlite3.Connection) -> dict[str, tuple[str, str, str]]:
+    """Preload session_v2 metadata once (typically <100 rows) to avoid per-row
+    LEFT JOIN string copies and repeated Path(directory).name calls."""
+    smap: dict[str, tuple[str, str, str]] = {}
+    for sid, directory, title, slug in conn.execute(
+            "SELECT id, directory, title, slug FROM session_v2"):
+        d_str = directory or ""
+        proj = Path(d_str).name if d_str else "(none)"
+        smap[sid] = (d_str, proj, title or slug or "")
+    return smap
+
+
+def _scan_messages(conn: sqlite3.Connection, flt):
+    """Single-pass index-routed scan of session_message for both assistant and
+    user rows.  Uses multi-path json_extract in SQLite C so the ~243 MB
+    'content' arrays are never copied into Python or parsed by json.loads."""
+    cache_key = (id(conn), flt.lo, flt.hi, flt.bounded_time, flt.session, flt.project)
+    cached = getattr(flt, "_scan_cache", None)
+    if cached and cached[0] == cache_key:
+        return cached[1], cached[2]
+
+    smap = _load_sessions_map(conn)
+    where = []
+    params: list = []
+
+    # Route to the most selective SQLite index:
+    # 1. --session prefix -> session_message_session_type_seq_idx (session_id, type, seq)
+    # 2. --project filter -> filter session_v2 first, then seek session_id IN (...)
+    # 3. --since/--until  -> session_message_time_created_idx (time_created)
+    # 4. unbounded all-time -> sequential table scan (+sm.type avoids random B-tree seeks)
+    use_session_idx = False
+    if flt.session:
+        hi_prefix = flt.session[:-1] + chr(ord(flt.session[-1]) + 1)
+        where.append("sm.session_id >= ? AND sm.session_id < ?")
+        params.extend([flt.session, hi_prefix])
+        use_session_idx = True
+    elif flt.project and flt.project not in "(none)":
+        matching_sids = [
+            sid for sid, (d_str, proj, _t) in smap.items()
+            if flt.project in proj.lower() or flt.project in d_str.lower()
+        ]
+        if not matching_sids:
+            flt._scan_cache = (cache_key, [], [])
+            return [], []
+        placeholders = ",".join("?" for _ in matching_sids)
+        where.append(f"sm.session_id IN ({placeholders})")
+        params.extend(matching_sids)
+        use_session_idx = True
+
+    if use_session_idx:
+        where.append("sm.type IN ('assistant', 'user')")
+        if flt.bounded_time:
+            where.append("sm.time_created >= ? AND sm.time_created < ?")
+            params.extend([flt.lo, flt.hi])
+    elif flt.bounded_time:
+        where.append("sm.time_created >= ? AND sm.time_created < ?")
+        params.extend([flt.lo, flt.hi])
+        where.append("sm.type IN ('assistant', 'user')")
+    else:
+        where.append("+sm.type IN ('assistant', 'user')")
+
+    sql = f"""
+    SELECT sm.session_id,
+           sm.time_created,
+           sm.type,
+           CASE WHEN sm.type = 'assistant' THEN
+               json_extract(sm.data,
+                   '$.model.providerID', '$.model.id', '$.model.variant', '$.agent',
+                   '$.tokens.input', '$.tokens.output', '$.tokens.reasoning',
+                   '$.tokens.cache.read', '$.tokens.cache.write', '$.cost')
+           END
+    FROM session_message AS sm
+    WHERE {' AND '.join(where)}
+    """
+
+    rows = []
+    prompts = []
+    jloads = json.loads
+    default_sinfo = ("", "(none)", "")
+    for session_id, ts, mtype, jarr in conn.execute(sql, params):
+        d_str, proj, title = smap.get(session_id, default_sinfo)
+        dt, day_s, wk_s, mo_s, hr_s, dow_s = _dt_fields(ts)
+        if mtype == "assistant":
+            if not jarr:
+                continue
+            try:
+                vals = jloads(jarr)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            rows.append({
+                "ts": ts,
+                "dt": dt,
+                "day": day_s,
+                "week": wk_s,
+                "month": mo_s,
+                "hour": hr_s,
+                "dow": dow_s,
+                "provider": vals[0] or "unknown",
+                "model": vals[1] or "unknown",
+                "variant": vals[2] or "",
+                "agent": vals[3] or "unknown",
+                "session": session_id,
+                "directory": d_str,
+                "project": proj,
+                "title": title,
+                "in": vals[4] or 0,
+                "out": vals[5] or 0,
+                "reason": vals[6] or 0,
+                "cr": vals[7] or 0,
+                "cw": vals[8] or 0,
+                "cost": float(vals[9] or 0.0),
+            })
+        else:
+            prompts.append({
+                "ts": ts,
+                "dt": dt,
+                "day": day_s,
+                "week": wk_s,
+                "month": mo_s,
+                "hour": hr_s,
+                "dow": dow_s,
+                "provider": "unknown",
+                "model": "unknown",
+                "agent": "unknown",
+                "session": session_id,
+                "directory": d_str,
+                "project": proj,
+            })
+
+    flt._scan_cache = (cache_key, rows, prompts)
+    return rows, prompts
 
 
 def fetch_rows(conn: sqlite3.Connection, flt) -> list[dict]:
     """Return normalized usage records for assistant messages in [lo, hi)."""
-    rows = []
-    for session_id, ts, data, directory, title, slug in conn.execute(QUERY, (flt.lo, flt.hi)):
-        try:
-            d = json.loads(data)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        model = d.get("model") or {}
-        toks = d.get("tokens") or {}
-        cache = toks.get("cache") or {}
-        dt = datetime.fromtimestamp(ts / 1000)
-        rows.append({
-            "ts": ts,
-            "dt": dt,
-            "day": dt.strftime("%Y-%m-%d"),
-            "week": (dt - timedelta(days=dt.weekday())).strftime("%Y-%m-%d"),
-            "month": dt.strftime("%Y-%m"),
-            "hour": dt.strftime("%H"),
-            "dow": DOW_NAMES[dt.weekday()],
-            "provider": model.get("providerID") or "unknown",
-            "model": model.get("id") or "unknown",
-            "variant": model.get("variant") or "",
-            "agent": d.get("agent") or "unknown",
-            "session": session_id,
-            "directory": directory or "",
-            "project": (Path(directory).name if directory else "(none)"),
-            "title": title or slug or "",
-            "in": toks.get("input") or 0,
-            "out": toks.get("output") or 0,
-            "reason": toks.get("reasoning") or 0,
-            "cr": cache.get("read") or 0,
-            "cw": cache.get("write") or 0,
-            "cost": d.get("cost") or 0.0,
-        })
+    rows, _prompts = _scan_messages(conn, flt)
     return rows
-
-
-PROMPT_QUERY = """
-SELECT sm.session_id,
-       sm.time_created,
-       sm.data,
-       sv.directory
-FROM session_message AS sm
-LEFT JOIN session_v2 AS sv ON sv.id = sm.session_id
-WHERE sm.type = 'user'
-  AND sm.time_created >= ? AND sm.time_created < ?
-"""
 
 
 def fetch_prompts(conn: sqlite3.Connection, flt) -> list[dict]:
     """One record per user prompt (message turn), normalized like usage rows.
     Model/provider/agent filters are applied AFTER attribute_prompts() so user
     rows (which lack model metadata in OpenCode v2) inherit their turn's model."""
-    out = []
-    for session_id, ts, data, directory in conn.execute(PROMPT_QUERY, (flt.lo, flt.hi)):
-        try:
-            d = json.loads(data)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        model = d.get("model") or {}
-        if flt.project:
-            proj = (Path(directory).name if directory else "(none)").lower()
-            if flt.project not in proj and flt.project not in (directory or "").lower():
-                continue
-        if flt.session and not session_id.startswith(flt.session):
-            continue
-        dt = datetime.fromtimestamp(ts / 1000)
-        out.append({
-            "ts": ts, "dt": dt,
-            "day": dt.strftime("%Y-%m-%d"),
-            "week": (dt - timedelta(days=dt.weekday())).strftime("%Y-%m-%d"),
-            "month": dt.strftime("%Y-%m"),
-            "hour": dt.strftime("%H"),
-            "dow": DOW_NAMES[dt.weekday()],
-            "provider": model.get("providerID") or "unknown",
-            "model": model.get("id") or "unknown",
-            "agent": d.get("agent") or "unknown",
-            "session": session_id,
-            "directory": directory or "",
-            "project": (Path(directory).name if directory else "(none)"),
-        })
-    return out
+    _rows, prompts = _scan_messages(conn, flt)
+    return prompts
 
 
 def attribute_prompts(prompts: list[dict], rows: list[dict]) -> list[dict]:
@@ -245,6 +316,7 @@ class Filters:
     def __init__(self, args):
         self.args = args
         self.lo, self.hi = self._range(args.since, args.until)
+        self.bounded_time = bool(args.since or args.until or getattr(args, "compare", None))
         self.model = (args.model or "").lower()
         self.provider = (args.provider or "").lower()
         self.agent = (args.agent or "").lower()
@@ -426,26 +498,37 @@ class Pricing:
                 for k in ("input", "output", "cache_read", "cache_write")}
 
     def estimate(self, row: dict):
-        """Estimated cost for one message, tier-aware. Returns float."""
+        """Estimated cost for one message, tier-aware and memoized per row."""
+        cached = row.get("_est")
+        if cached is not None:
+            return cached
         provider, model = row["provider"], row["model"]
-        rates, _src = self.rates(provider, model)
-        entry = None
-        # tier lookup needs the raw entry; find it again cheaply
-        doc = self.doc.get(provider, {}).get("models", {})
-        entry = doc.get(model) or doc.get(model.split("@")[0]) \
-            or doc.get(model.split("@")[0].split("/")[-1])
-        if entry and entry.get("cost", {}).get("tiers"):
+        key = (provider, model)
+        tinfo = self._resolved.get(("__tiers__", provider, model))
+        if tinfo is None:
+            rates, _src = self.rates(provider, model)
+            doc = self.doc.get(provider, {}).get("models", {})
+            entry = (doc.get(model) or doc.get(model.split("@")[0])
+                     or doc.get(model.split("@")[0].split("/")[-1]))
+            tiers = (entry.get("cost", {}).get("tiers") or []) if entry else []
+            tinfo = (rates, tiers)
+            self._resolved[("__tiers__", provider, model)] = tinfo
+        else:
+            rates, tiers = tinfo
+        if tiers:
             context = row["in"] + row["cr"] + row["cw"]
-            for tier in entry["cost"]["tiers"]:
+            for tier in tiers:
                 size = (tier.get("tier") or {}).get("size") or 0
                 if size and context > size:
                     rates = {k: float(tier.get(k) if tier.get(k) is not None
                                       else rates[k])
                              for k in rates}
-        return (row["in"] * rates["input"]
-                + row["out"] * rates["output"]
-                + row["cr"] * rates["cache_read"]
-                + row["cw"] * rates["cache_write"]) / 1_000_000
+        val = (row["in"] * rates["input"]
+               + row["out"] * rates["output"]
+               + row["cr"] * rates["cache_read"]
+               + row["cw"] * rates["cache_write"]) / 1_000_000
+        row["_est"] = val
+        return val
 
 
 # ----------------------------------------------------------------------------
