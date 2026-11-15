@@ -29,7 +29,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 PROG = "ocstats"
 
 DB_ENV = "OCSTATS_DB"
@@ -605,7 +605,7 @@ SORT_KEYS = {
     "sessions": lambda g: g["sessions"],
     "name": lambda g: 0,
     "date": lambda g: g["first_ts"],
-    "date-desc": lambda g: g["first_ts"],
+    "date-desc": lambda g: g["last_ts"],
 }
 
 
@@ -1063,9 +1063,11 @@ def apply_row_limits(groups, args, total_eff):
 
 
 def group_report(rows, flt, pricing, args, dims, title, name_width=34):
+    if "session" in dims and "project" not in dims:
+        idx = list(dims).index("session")
+        dims = list(dims[:idx + 1]) + ["project"] + list(dims[idx + 1:])
     prompt_rows = getattr(args, "prompt_rows", None)
-    sort_by = args.sort or ("date-desc" if args.command in
-                            ("daily", "weekly", "monthly") else "cost")
+    sort_by = args.sort or "date-desc"
     if args.top and args.bottom:
         sys.exit(f"{PROG}: --top and --bottom are mutually exclusive")
     groups = group_rows(rows, dims, pricing, prompt_rows)
@@ -1230,7 +1232,7 @@ def cmd_sessions(rows, flt, pricing, args):
     info = {}
     for r in rows:
         info.setdefault(r["session"], (r["title"], r["project"]))
-    groups = sort_groups(groups, args.sort or "cost", ["session"])
+    groups = sort_groups(groups, args.sort or "date-desc", ["session"])
     total_sessions = len(groups)
     if args.limit:
         groups = groups[: args.limit]
@@ -1238,25 +1240,25 @@ def cmd_sessions(rows, flt, pricing, args):
 
     if args.csv:
         w = csv.writer(sys.stdout, lineterminator="\n")
-        w.writerow(["session", "title", "project"] + list(METRIC_KEYS))
+        w.writerow(["session", "project", "title"] + list(METRIC_KEYS))
         for g in groups:
             title, project = info.get(g["session"], ("", ""))
-            w.writerow([g["session"], title, project] +
+            w.writerow([g["session"], project, title] +
                        [g.get(k, "") for k in METRIC_KEYS])
         return
     if args.json:
         out = []
         for g in groups:
             title, project = info.get(g["session"], ("", ""))
-            out.append({"session": g["session"], "title": title, "project": project,
+            out.append({"session": g["session"], "project": project, "title": title,
                         **{k: g[k] for k in METRIC_KEYS if k != "first_ts"},
                         "first_ts": g["first_ts"]})
         print(json.dumps({"meta": meta_json(flt, pricing), "rows": out}, indent=2))
         return
 
     t = Table("Sessions", width=term_width(args))
-    t.col("Session", "l", priority=10).col("Title", "l", priority=9) \
-     .col("Project", "l", priority=8) \
+    t.col("Session", "l", priority=10).col("Project", "l", priority=10) \
+     .col("Title", "l", priority=9) \
      .col("Msgs", "r", priority=6).col("Tokens", "r", priority=5) \
      .col("Rep $", "r", priority=5).col("Est $", "r", priority=3) \
      .col("Σ $", "r", priority=7).col("Share", "r", priority=2)
@@ -1264,8 +1266,9 @@ def cmd_sessions(rows, flt, pricing, args):
         title, project = info.get(g["session"], ("", ""))
         cells = cost_cells(g)
         sid = g["session"].replace("ses_", "")
-        t.add(C.dim(sid[:14]), truncate(title or "(untitled)", 36),
-              truncate(project, 26), tok(g["n"]), tok(g["tok_total"]),
+        t.add(C.dim(sid[:14]), truncate(project, 26),
+              truncate(title or "(untitled)", 36),
+              tok(g["n"]), tok(g["tok_total"]),
               cells[0], cells[1], cells[2],
               pct(g["cost_eff"] / total_eff))
     t.set_footer(C.bold("TOTAL"), "", "",
@@ -1366,10 +1369,30 @@ def cmd_pivot(rows, flt, pricing, args):
                         getattr(args, "prompt_rows", None))
     label, metric_fn, fmt = PIVOT_METRICS[args.metric]
 
-    col_keys = sorted({g[eff_coldim] for g in groups})
-    row_keys = sorted({g[rowdim] for g in groups},
-                      key=lambda rk: -sum(metric_fn(g) for g in groups
-                                          if g[rowdim] == rk))
+    col_keys = sorted({g[eff_coldim] for g in groups}, reverse=True)
+    row_last_ts = {}
+    for g in groups:
+        rk = g[rowdim]
+        if g["last_ts"] > row_last_ts.get(rk, 0):
+            row_last_ts[rk] = g["last_ts"]
+    pivot_sort = args.sort or "date-desc"
+    if pivot_sort in ("cost", "tokens", "msgs", "prompts", "rep", "est"):
+        row_keys = sorted({g[rowdim] for g in groups},
+                          key=lambda rk: -sum(metric_fn(g) for g in groups
+                                              if g[rowdim] == rk))
+    elif pivot_sort == "name":
+        row_keys = sorted({g[rowdim] for g in groups})
+    elif pivot_sort == "date":
+        row_keys = sorted({g[rowdim] for g in groups},
+                          key=lambda rk: (row_last_ts.get(rk, 0), str(rk)))
+    else:
+        row_keys = sorted({g[rowdim] for g in groups},
+                          key=lambda rk: (row_last_ts.get(rk, 0), str(rk)),
+                          reverse=True)
+    sess_proj = {}
+    if rowdim == "session":
+        for r in rows:
+            sess_proj.setdefault(r["session"], r["project"])
     row_totals = {rk: sum(metric_fn(g) for g in groups if g[rowdim] == rk)
                   for rk in row_keys}
     col_totals = {ck: sum(metric_fn(g) for g in groups if g[eff_coldim] == ck)
@@ -1451,19 +1474,21 @@ def cmd_pivot(rows, flt, pricing, args):
     print(f"  {C.bold(C.cyan(title))}  {C.dim('· ' + flt.describe())}")
 
     # text grid via the boxed renderer
-    headers = [rowdim.capitalize()] + [collabel(ck) for ck in col_keys] + ["Total"]
-    aligns = "l" + "r" * (len(col_keys) + 1)
-    trows, footer = [], None
+    extra_hdr = ["Project"] if rowdim == "session" else []
+    headers = [rowdim.capitalize()] + extra_hdr + [collabel(ck) for ck in col_keys] + ["Total"]
+    trows = []
     for rk in row_keys:
-        trows.append([truncate(rk, 28)] +
+        lead = [truncate(rk, 28)] + ([truncate(sess_proj.get(rk, ""), 26)] if rowdim == "session" else [])
+        trows.append(lead +
                      [fmtv(cell.get((rk, ck), 0), heat=True) for ck in col_keys] +
                      [C.bold(fmtv(row_totals[rk]))])
-    tbl = Table(width=max(term_width(args), 20 * (len(col_keys) + 2)))
+    tbl = Table(width=max(term_width(args), 20 * (len(col_keys) + 2 + len(extra_hdr))))
     for i, h in enumerate(headers):
-        tbl.col(h, "r" if i else "l", priority=10 if i == 0 else 5)
+        is_name_col = i < (2 if rowdim == "session" else 1)
+        tbl.col(h, "l" if is_name_col else "r", priority=10 if is_name_col else 5)
     for r in trows:
         tbl.add(*r)
-    tbl.set_footer(*([C.bold("TOTAL")] +
+    tbl.set_footer(*([C.bold("TOTAL")] + ([""] if rowdim == "session" else []) +
                      [C.bold(fmtv(col_totals[ck])) for ck in col_keys] +
                      [C.bold(C.white(fmtv(grand)))]))
     tbl.note = (f"heat: dim <25% <50% <75% ≤max of {label.lower()} · "
@@ -2112,8 +2137,8 @@ def build_parser():
     out.add_argument("--limit", type=int, default=argparse.SUPPRESS,
                      help="max rows (0 = all, default 25)")
     out.add_argument("--sort", default=argparse.SUPPRESS,
-                     help="sort key: cost, rep, est, tokens, msgs, sessions, "
-                          "name, date, date-desc (default cost)")
+                     help="sort key: date-desc (default), date, cost, rep, est, "
+                          "tokens, msgs, sessions, name")
 
     p = argparse.ArgumentParser(
         prog=PROG,

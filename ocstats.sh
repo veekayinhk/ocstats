@@ -36,7 +36,7 @@
 set -euo pipefail
 
 PROG="ocstats"
-VERSION="1.2.1"
+VERSION="1.2.2"
 DB="${OCSTATS_DB:-$HOME/.local/share/opencode/opencode.db}"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ocstats"
 CACHE_FILE="$CACHE_DIR/api.json"
@@ -620,6 +620,9 @@ function hitpct(cr, tin, cw) { return (cr + tin + cw > 0) ? sprintf("%.1f%%", cr
 
 group_report() { # group_report <title> <dims csv> [lo hi]
     local title="$1" dims_csv="$2" glo="${3:-$LO_MS}" ghi="${4:-$HI_MS}"
+    if [[ ",$dims_csv," == *",session,"* && ",$dims_csv," != *",project,"* ]]; then
+        dims_csv="${dims_csv/session/session,project}"
+    fi
     ensure_data "$glo" "$ghi"
     ensure_rates
     local ndim raw total
@@ -633,16 +636,16 @@ group_report() { # group_report <title> <dims csv> [lo hi]
     local e=$((ndim + 11))   # eff column
     local tcol=$((ndim + 18)) # tok_total column
     case "$SORT" in
+        cost|eff) raw=$(sort -t$'\t' -k"$e,$e"gr <<<"$raw") ;;
         tokens)  raw=$(awk -F'\t' -v c="$tcol" '{ print $c "\t" $0 }' <<<"$raw" | sort -t$'\t' -k1,1gr | cut -f2-) ;;
         name)    raw=$(sort -t$'\t' <<<"$raw") ;;
         date)    raw=$(sort -t$'\t' -k$((ndim+12)),$((ndim+12))n <<<"$raw") ;;
-        date-desc) raw=$(sort -t$'\t' -k$((ndim+12)),$((ndim+12))nr <<<"$raw") ;;
         msgs)    raw=$(sort -t$'\t' -k$((ndim+1)),$((ndim+1))gr <<<"$raw") ;;
         prompts) raw=$(sort -t$'\t' -k$((ndim+2)),$((ndim+2))gr <<<"$raw") ;;
         sessions) raw=$(sort -t$'\t' -k$((ndim+3)),$((ndim+3))gr <<<"$raw") ;;
         rep)     raw=$(sort -t$'\t' -k$((ndim+9)),$((ndim+9))gr <<<"$raw") ;;
         est)     raw=$(sort -t$'\t' -k$((ndim+10)),$((ndim+10))gr <<<"$raw") ;;
-        *)       raw=$(sort -t$'\t' -k"$e,$e"gr <<<"$raw") ;;
+        *)       raw=$(sort -t$'\t' -k$((ndim+13)),$((ndim+13))nr <<<"$raw") ;;
     esac
     ((BOTTOMN > 0)) && raw=$(tac <<<"$raw")
 
@@ -1096,17 +1099,18 @@ cmd_pivot() {
         { VAL[$1 SUBSEP $2] = $mc + 0
           if (!($2 in ColSeen)) { ColSeen[$2] = 1; NC++; ColKeys[NC] = $2 }
           RowTot[$1] += $mc + 0
+          if ($15 + 0 > RowLast[$1]) RowLast[$1] = $15 + 0
           ColTot[$2] += $mc + 0
           if ($mc + 0 > MX) MX = $mc + 0
           GRAND += $mc + 0
           if (!($1 in RowSeen)) { RowSeen[$1] = 1; NRK++; RowKeys[NRK] = $1 } }
         END {
-            # sort columns ascending by key
+            # sort columns descending by key (date-desc)
             for (i = 1; i <= NC; i++) for (j = i + 1; j <= NC; j++)
-                if (ColKeys[j] < ColKeys[i]) { t = ColKeys[i]; ColKeys[i] = ColKeys[j]; ColKeys[j] = t }
-            # sort rows descending by total
+                if (ColKeys[j] > ColKeys[i]) { t = ColKeys[i]; ColKeys[i] = ColKeys[j]; ColKeys[j] = t }
+            # sort rows descending by last_ts (date-desc)
             for (i = 1; i <= NRK; i++) for (j = i + 1; j <= NRK; j++)
-                if (RowTot[RowKeys[j]] > RowTot[RowKeys[i]]) { t = RowKeys[i]; RowKeys[i] = RowKeys[j]; RowKeys[j] = t }
+                if (RowLast[RowKeys[j]] > RowLast[RowKeys[i]]) { t = RowKeys[i]; RowKeys[i] = RowKeys[j]; RowKeys[j] = t }
             # header
             line = rd
             for (i = 1; i <= NC; i++) line = line "\t" label(ColKeys[i])
@@ -1813,11 +1817,11 @@ declare -A DUMP_CACHE=()
 
 case "$CMD" in
     summary)   cmd_summary ;;
-    models)    SORT="${SORT:-cost}"; group_report "Usage by model" "provider,model" ;;
-    providers) SORT="${SORT:-cost}"; group_report "Usage by provider" "provider" ;;
-    agents)    SORT="${SORT:-cost}"; group_report "Usage by agent" "agent" ;;
-    projects)  SORT="${SORT:-cost}"; group_report "Usage by project" "project" ;;
-    sessions)  SORT="${SORT:-cost}"; group_report "Sessions" "session" ;;
+    models)    SORT="${SORT:-date-desc}"; group_report "Usage by model" "provider,model" ;;
+    providers) SORT="${SORT:-date-desc}"; group_report "Usage by provider" "provider" ;;
+    agents)    SORT="${SORT:-date-desc}"; group_report "Usage by agent" "agent" ;;
+    projects)  SORT="${SORT:-date-desc}"; group_report "Usage by project" "project" ;;
+    sessions)  SORT="${SORT:-date-desc}"; group_report "Sessions" "session,project" ;;
     daily)     SORT="${SORT:-date-desc}"; group_report "Usage by day" "day" ;;
     weekly)    SORT="${SORT:-date-desc}"; group_report "Usage by week" "week" ;;
     monthly)   SORT="${SORT:-date-desc}"; group_report "Usage by month" "month" ;;
@@ -1835,7 +1839,7 @@ case "$CMD" in
                 *) echo "$PROG: unknown dimension '$d' (choose from: model provider agent project session day week month hour dow)" >&2; exit 1 ;;
             esac
         done
-        SORT="${SORT:-cost}"
+        SORT="${SORT:-date-desc}"
         group_report "Matrix by ${MATRIX_BY//,/ × }" "$MATRIX_BY" ;;
     prices)    cmd_prices ;;
     *) echo "$PROG: unknown command '$CMD'" >&2; exit 1 ;;

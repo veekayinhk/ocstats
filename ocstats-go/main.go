@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	version      = "1.2.1"
+	version      = "1.2.2"
 	prog         = "ocstats"
 	modelsDevURL = "https://models.dev/api.json"
 )
@@ -778,6 +778,8 @@ func timeDim(t time.Time, dim string) string {
 func sortGroups(gs []*Group, by string) {
 	less := func(a, b *Group) bool { return false }
 	switch by {
+	case "cost":
+		less = func(a, b *Group) bool { return a.Eff > b.Eff }
 	case "rep":
 		less = func(a, b *Group) bool { return a.Rep > b.Rep }
 	case "est":
@@ -792,10 +794,8 @@ func sortGroups(gs []*Group, by string) {
 		less = func(a, b *Group) bool { return strings.Join(a.Key, "/") < strings.Join(b.Key, "/") }
 	case "date":
 		less = func(a, b *Group) bool { return a.FirstTS.Before(b.FirstTS) }
-	case "date-desc":
-		less = func(a, b *Group) bool { return a.FirstTS.After(b.FirstTS) }
-	default: // cost
-		less = func(a, b *Group) bool { return a.Eff > b.Eff }
+	default: // date-desc
+		less = func(a, b *Group) bool { return a.LastTS.After(b.LastTS) }
 	}
 	sort.SliceStable(gs, func(i, j int) bool { return less(gs[i], gs[j]) })
 }
@@ -1715,9 +1715,27 @@ func maxF(v []float64) float64 {
 type jrow map[string]any
 
 func groupReport(w io.Writer, rows []Row, flt *Filters, p *pricing, o *options, dims []string, title string) error {
+	hasSess, hasProj := false, false
+	sessIdx := 0
+	for i, d := range dims {
+		if d == "session" {
+			hasSess = true
+			sessIdx = i
+		}
+		if d == "project" {
+			hasProj = true
+		}
+	}
+	if hasSess && !hasProj {
+		expanded := make([]string, 0, len(dims)+1)
+		expanded = append(expanded, dims[:sessIdx+1]...)
+		expanded = append(expanded, "project")
+		expanded = append(expanded, dims[sessIdx+1:]...)
+		dims = expanded
+	}
 	sortBy := o.sortBy
 	if sortBy == "" {
-		sortBy = "cost"
+		sortBy = "date-desc"
 	}
 	gs := groupRows(rows, dims, p, o.promptRows)
 	sortGroups(gs, sortBy)
@@ -1979,7 +1997,7 @@ func round6(v float64) float64 { return math.Round(v*1e6) / 1e6 }
 
 func cmdSessions(w io.Writer, rows []Row, flt *Filters, p *pricing, o *options) error {
 	gs := groupRows(rows, []string{"session"}, p, o.promptRows)
-	sortGroups(gs, firstNonEmpty(o.sortBy, "cost"))
+	sortGroups(gs, firstNonEmpty(o.sortBy, "date-desc"))
 	totalEff := 0.0
 	for _, g := range gs {
 		totalEff += g.Eff

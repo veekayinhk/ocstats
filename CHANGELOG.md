@@ -3,6 +3,12 @@
 All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.2.2] - 2026-11-15
+
+### Changed
+- **Session tables include `Project` column**: `ocstats sessions`, `matrix --by session`, and `pivot --rows session` now always display the `Project` column right alongside `Session` across Python, Bash, and Go (and pin `Project` at top priority so it is never dropped on narrower terminals).
+- **Default ordering is `date-desc`**: Output tables across commands now order by `date-desc` (most recent activity first) by default; use `--sort cost` (or `tokens`, `msgs`, `name`, `date`) to sort by other keys.
+
 ## [1.2.1] - 2026-11-04
 
 ### Changed

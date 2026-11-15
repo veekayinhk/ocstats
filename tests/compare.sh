@@ -199,6 +199,16 @@ awk -v a="$pc_py" -v b="$pc_sh" 'BEGIN{d=a-b;if(d<0)d=-d;exit !(d<1)}' \
     && ok "punchcard --by provider 7x24 grid ($pc_py)" \
     || bad "punchcard total: python=$pc_py bash=$pc_sh"
 
+# sessions and matrix --by session always include Project column
+sess_tmp=$(mktemp)
+"$PY" sessions --no-color --limit 2 >"$sess_tmp" && grep -q "Project" "$sess_tmp" \
+    && "$PY" matrix --by session --no-color --limit 2 >"$sess_tmp" && grep -q "Project" "$sess_tmp" \
+    && timeout 90 "$SH" sessions --no-color --limit 2 >"$sess_tmp" 2>&1 && grep -q "Project" "$sess_tmp" \
+    && timeout 90 "$SH" matrix --by session --no-color --limit 2 >"$sess_tmp" 2>&1 && grep -q "Project" "$sess_tmp" \
+    && ok "sessions & matrix --by session include Project column" \
+    || bad "sessions table missing Project column"
+rm -f "$sess_tmp"
+
 # --- go binary (only when built) ---------------------------------------------
 if [[ -x "$GO_BIN" ]]; then
     echo "go binary:"
