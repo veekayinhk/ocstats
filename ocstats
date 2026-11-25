@@ -29,7 +29,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 PROG = "ocstats"
 
 DB_ENV = "OCSTATS_DB"
@@ -209,7 +209,8 @@ def _scan_messages(conn: sqlite3.Connection, flt):
                json_extract(sm.data,
                    '$.model.providerID', '$.model.id', '$.model.variant', '$.agent',
                    '$.tokens.input', '$.tokens.output', '$.tokens.reasoning',
-                   '$.tokens.cache.read', '$.tokens.cache.write', '$.cost')
+                   '$.tokens.cache.read', '$.tokens.cache.write', '$.cost',
+                   '$.time.firstToken', '$.time.streamed')
            END
     FROM session_message AS sm
     WHERE {' AND '.join(where)}
@@ -229,6 +230,14 @@ def _scan_messages(conn: sqlite3.Connection, flt):
                 vals = jloads(jarr)
             except (json.JSONDecodeError, TypeError):
                 continue
+            out_t = vals[5] or 0
+            reason_t = vals[6] or 0
+            # generation speed: (output + reasoning) over the streaming window,
+            # matching OpenCode's own tok/s definition.  Older messages without
+            # streamed timestamps contribute no speed sample.
+            gen_start = vals[10] or ts
+            gen_end = vals[11] or 0
+            gen_ms = gen_end - gen_start if gen_end > gen_start else 0
             rows.append({
                 "ts": ts,
                 "dt": dt,
@@ -246,11 +255,13 @@ def _scan_messages(conn: sqlite3.Connection, flt):
                 "project": proj,
                 "title": title,
                 "in": vals[4] or 0,
-                "out": vals[5] or 0,
-                "reason": vals[6] or 0,
+                "out": out_t,
+                "reason": reason_t,
                 "cr": vals[7] or 0,
                 "cw": vals[8] or 0,
                 "cost": float(vals[9] or 0.0),
+                "gen_tok": (out_t + reason_t) if gen_ms else 0,
+                "gen_ms": gen_ms,
             })
         else:
             prompts.append({
@@ -560,6 +571,8 @@ def group_rows(rows: list[dict], dims, pricing: Pricing,
         in_sum = sum(i["in"] for i in items)
         cr_sum = sum(i["cr"] for i in items)
         cw_sum = sum(i["cw"] for i in items)
+        gen_tok = sum(i["gen_tok"] for i in items)
+        gen_ms = sum(i["gen_ms"] for i in items)
         out.append({
             **rec,
             "n": len(items),
@@ -571,6 +584,9 @@ def group_rows(rows: list[dict], dims, pricing: Pricing,
             "cr": cr_sum,
             "cw": cw_sum,
             "tok_total": sum(toks),
+            "gen_tok": gen_tok,
+            "gen_ms": gen_ms,
+            "tok_per_sec": (gen_tok / (gen_ms / 1000)) if gen_ms > 0 else 0.0,
             "cost_rep": rep,
             "cost_est": est,
             "cost_eff": eff,
@@ -601,6 +617,7 @@ SORT_KEYS = {
     "rep": lambda g: g["cost_rep"],
     "est": lambda g: g["cost_est"],
     "tokens": lambda g: g["tok_total"],
+    "speed": lambda g: g["tok_per_sec"],
     "msgs": lambda g: g["n"],
     "sessions": lambda g: g["sessions"],
     "name": lambda g: 0,
@@ -804,6 +821,19 @@ def cost_cells(g, max_cost=None):
     return (C.dim(rep) if g["cost_rep"] == 0 else C.yellow(rep),
             C.dim(est) if no_price else C.green(est),
             C.bold(C.white(eff)))
+
+
+def speed_cell(g):
+    """Tok/s cell; '—' when no message in the group has streaming timestamps."""
+    if g.get("gen_ms", 0) <= 0:
+        return C.dim("—")
+    return C.cyan(f"{g['tok_per_sec']:.1f}")
+
+
+def speed_total(groups):
+    gen_tok = sum(g.get("gen_tok", 0) for g in groups)
+    gen_ms = sum(g.get("gen_ms", 0) for g in groups)
+    return (gen_tok / (gen_ms / 1000)) if gen_ms > 0 else 0.0
 
 
 def csv_write(title_rows: list[dict], dims: list[str]):
@@ -1031,7 +1061,9 @@ def metric_columns(t: Table, details=False, metric=None):
         return t
     t.col("Msgs", "r", priority=6).col("Sessions", "r", priority=4) \
      .col("Tok in", "r", priority=5).col("Tok out", "r", priority=3) \
+     .col("Tokens", "r", priority=6) \
      .col("Cache R", "r", priority=4).col("Cache hit", "r", priority=2) \
+     .col("Tok/s", "r", priority=5) \
      .col("Rep $", "r", priority=5).col("Est $", "r", priority=3) \
      .col("Σ $", "r", priority=7).col("Share", "r", priority=2)
     if details:
@@ -1116,7 +1148,8 @@ def group_report(rows, flt, pricing, args, dims, title, name_width=34):
             row.append(tok(focus(g)) if args.metric != "cost" else money(g["cost_eff"]))
         else:
             row += [tok(g["n"]), tok(g["sessions"]), tok(g["in"]), tok(g["out"]),
-                    tok(g["cr"]), pct(g["cache_ratio"]), cells[0], cells[1], cells[2],
+                    tok(g["tok_total"]), tok(g["cr"]), pct(g["cache_ratio"]),
+                    speed_cell(g), cells[0], cells[1], cells[2],
                     pct(g["cost_eff"] / total_eff)]
             if getattr(args, "details", False):
                 row += [tok(g["prompts"]), tok(g["reason"]), tok(g["cw"]),
@@ -1141,31 +1174,39 @@ def group_report(rows, flt, pricing, args, dims, title, name_width=34):
             "n": sum(g["n"] for g in rest_all),
             "sessions": sum(g["sessions"] for g in rest_all),
             "in": sum(g["in"] for g in rest_all), "out": sum(g["out"] for g in rest_all),
+            "tok_total": sum(g["tok_total"] for g in rest_all),
             "cr": sum(g["cr"] for g in rest_all),
             "cost_rep": sum(g["cost_rep"] for g in rest_all),
             "cost_est": sum(g["cost_est"] for g in rest_all),
             "cost_eff": sum(g["cost_eff"] for g in rest_all),
             "cache_ratio": 0.0,
         }
+        rest_tps = speed_total(rest_all)
         t.add(*([C.dim(f"+ {len(rest_all)} more")] + [C.dim("")] * (len(dims) - 1)),
               C.dim(tok(agg["n"])), C.dim(tok(agg["sessions"])),
-              C.dim(tok(agg["in"])), C.dim(tok(agg["out"])), C.dim(tok(agg["cr"])),
-              C.dim("—"), C.dim(money(agg["cost_rep"])),
+              C.dim(tok(agg["in"])), C.dim(tok(agg["out"])),
+              C.dim(tok(agg["tok_total"])), C.dim(tok(agg["cr"])),
+              C.dim("—"), C.dim(f"{rest_tps:.1f}" if rest_tps else "—"),
+              C.dim(money(agg["cost_rep"])),
               C.dim(money(agg["cost_est"])), C.dim(money(agg["cost_eff"])),
               C.dim(pct(agg["cost_eff"] / total_eff)))
+    total_tps = speed_total(groups)
     t.set_footer(*([C.bold("TOTAL")] + [""] * (len(dims) - 1)),
                  C.bold(tok(sum(g["n"] for g in groups))),
                  C.bold(tok(len({r["session"] for r in rows}))),
                  C.bold(tok(sum(g["in"] for g in groups))),
                  C.bold(tok(sum(g["out"] for g in groups))),
+                 C.bold(tok(sum(g["tok_total"] for g in groups))),
                  C.bold(tok(sum(g["cr"] for g in groups))),
                  C.bold(pct(sum(r["cr"] for r in rows) /
                             (sum(r["cr"] + r["in"] + r["cw"] for r in rows) or 1))),
+                 C.bold(C.cyan(f"{total_tps:.1f}") if total_tps else C.dim("—")),
                  C.bold(C.yellow(money(sum(g["cost_rep"] for g in groups)))),
                  C.bold(C.green(money(sum(g["cost_est"] for g in groups)))),
                  C.bold(C.white(money(sum(g["cost_eff"] for g in groups)))),
                  C.bold("100%"))
-    t.note = "Σ = reported where > 0, else estimated · — = no pricing data available"
+    t.note = ("Σ = reported where > 0, else estimated · — = no pricing data "
+              "available · Tok/s = (output+reasoning) ÷ streamed time")
     if getattr(args, "min_share", 0):
         t.note += f" · {hid_n} group(s) below {args.min_share:g}% share hidden"
     print()
@@ -1175,7 +1216,8 @@ def group_report(rows, flt, pricing, args, dims, title, name_width=34):
 
 METRIC_KEYS = ("n", "prompts", "sessions", "in", "out", "reason", "cr", "cw",
                "tok_total", "cost_rep", "cost_est", "cost_eff", "cache_ratio",
-               "tok_mean", "tok_median", "tok_p90", "first_ts", "last_ts")
+               "tok_mean", "tok_median", "tok_p90", "first_ts", "last_ts",
+               "tok_per_sec")
 
 
 def cmd_time_series(rows, flt, pricing, args, dim, label):
@@ -1200,26 +1242,34 @@ def cmd_time_series(rows, flt, pricing, args, dim, label):
 
     print_hint_pricing(pricing)
     t = Table(f"Usage by {singular}", width=term_width(args))
-    t.col(singular.capitalize(), "l", priority=10).col("Msgs", "r").col("Tok in", "r") \
-     .col("Tok out", "r", priority=1).col("Cache R", "r") \
-     .col("Rep $", "r").col("Est $", "r", priority=1).col("Σ $", "r") \
+    t.col(singular.capitalize(), "l", priority=10).col("Msgs", "r", priority=6) \
+     .col("Tokens", "r", priority=10).col("Tok in", "r", priority=5) \
+     .col("Tok out", "r", priority=3).col("Cache R", "r", priority=4) \
+     .col("Tok/s", "r", priority=6) \
+     .col("Rep $", "r", priority=5).col("Est $", "r", priority=3) \
+     .col("Σ $", "r", priority=7) \
      .col("Mix", "l", priority=2).col("Cost", "l", priority=3)
     for g in groups:
         cells = cost_cells(g)
-        t.add(C.bold(g[dim]), tok(g["n"]), tok(g["in"]), tok(g["out"]), tok(g["cr"]),
+        t.add(C.bold(g[dim]), tok(g["n"]), tok(g["tok_total"]), tok(g["in"]),
+              tok(g["out"]), tok(g["cr"]), speed_cell(g),
               cells[0], cells[1], cells[2],
               spark([g["in"], g["out"], g["cr"], g["cw"]]),
               bar(g["cost_eff"] / mx))
+    total_tps = speed_total(groups)
     t.set_footer(C.bold("TOTAL"), C.bold(tok(sum(g["n"] for g in groups))),
+                 C.bold(tok(sum(g["tok_total"] for g in groups))),
                  C.bold(tok(sum(g["in"] for g in groups))),
                  C.bold(tok(sum(g["out"] for g in groups))),
                  C.bold(tok(sum(g["cr"] for g in groups))),
+                 C.bold(C.cyan(f"{total_tps:.1f}") if total_tps else C.dim("—")),
                  C.bold(C.yellow(money(sum(g["cost_rep"] for g in groups)))),
                  C.bold(C.green(money(sum(g["cost_est"] for g in groups)))),
                  C.bold(C.white(money(sum(g["cost_eff"] for g in groups)))),
                  C.bold(""), C.bold(""))
     t.note = ("Mix sparkline = in·out·cacheR·cacheW · "
-              "Σ = reported where > 0, else estimated")
+              "Σ = reported where > 0, else estimated · "
+              "Tok/s = (output+reasoning) ÷ streamed time")
     print()
     print(t.render())
     print()
@@ -1259,7 +1309,8 @@ def cmd_sessions(rows, flt, pricing, args):
     t = Table("Sessions", width=term_width(args))
     t.col("Session", "l", priority=10).col("Project", "l", priority=10) \
      .col("Title", "l", priority=9) \
-     .col("Msgs", "r", priority=6).col("Tokens", "r", priority=5) \
+     .col("Msgs", "r", priority=6).col("Tokens", "r", priority=6) \
+     .col("Tok/s", "r", priority=6) \
      .col("Rep $", "r", priority=5).col("Est $", "r", priority=3) \
      .col("Σ $", "r", priority=7).col("Share", "r", priority=2)
     for g in groups:
@@ -1268,18 +1319,21 @@ def cmd_sessions(rows, flt, pricing, args):
         sid = g["session"].replace("ses_", "")
         t.add(C.dim(sid[:14]), truncate(project, 26),
               truncate(title or "(untitled)", 36),
-              tok(g["n"]), tok(g["tok_total"]),
+              tok(g["n"]), tok(g["tok_total"]), speed_cell(g),
               cells[0], cells[1], cells[2],
               pct(g["cost_eff"] / total_eff))
+    total_tps = speed_total(groups)
     t.set_footer(C.bold("TOTAL"), "", "",
                  C.bold(tok(sum(g["n"] for g in groups))),
                  C.bold(tok(sum(g["tok_total"] for g in groups))),
+                 C.bold(C.cyan(f"{total_tps:.1f}") if total_tps else C.dim("—")),
                  C.bold(C.yellow(money(sum(g["cost_rep"] for g in groups)))),
                  C.bold(C.green(money(sum(g["cost_est"] for g in groups)))),
                  C.bold(C.white(money(sum(g["cost_eff"] for g in groups)))),
                  C.bold(""))
     t.note = (f"top {len(groups)} of {total_sessions} sessions · "
-              "Σ = reported where > 0, else estimated")
+              "Σ = reported where > 0, else estimated · "
+              "Tok/s = (output+reasoning) ÷ streamed time")
     print()
     print(t.render())
     print()
@@ -2138,7 +2192,7 @@ def build_parser():
                      help="max rows (0 = all, default 25)")
     out.add_argument("--sort", default=argparse.SUPPRESS,
                      help="sort key: date-desc (default), date, cost, rep, est, "
-                          "tokens, msgs, sessions, name")
+                          "tokens, speed, msgs, sessions, name")
 
     p = argparse.ArgumentParser(
         prog=PROG,

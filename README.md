@@ -99,7 +99,7 @@ ocstats providers           # per provider
 ocstats agents              # per agent (build/plan/explore/…)
 ocstats projects            # per project directory
 ocstats sessions            # top sessions by effective cost
-ocstats daily | weekly | monthly
+ocstats daily | weekly | monthly    # per-bucket totals, incl. Tokens and Tok/s
 ocstats matrix --by provider,month     # any dimension combination
 ocstats matrix --by model,day --metric cost   # focused single-metric view
 ocstats pivot --rows project --cols day       # cross-tab grid with heat shading
@@ -214,6 +214,14 @@ token total and cache-hit ratio. Group tables expose the same detail via
 `--details` (Prompts, Reasoning, Cache W, mean/median/p90 tokens per message,
 first/last seen), and `--json` / `--csv` always carry every field.
 
+Every group table also shows a **Tokens** total column and, when the database
+has streaming timings, a **Tok/s** column: output + reasoning tokens divided
+by the model's streaming window (`time.firstToken` → `time.streamed`), the
+same definition OpenCode uses. Messages without streaming timestamps are
+skipped for speed (rendered as `—`) but still count toward every token and
+cost total. `--sort speed` orders any group table by throughput, and
+`tok_per_sec` is included in `--json` / `--csv` output.
+
 ## Filters
 
 ```
@@ -267,7 +275,7 @@ source each rate came from (`override`, `models.dev`, `models.dev~`, `none`).
 --top N           top N groups by the current sort
 --bottom N        bottom N groups by the current sort
 --min-share P     hide groups below P% share of effective cost (totals stay complete)
---sort KEY        cost (default) | rep | est | tokens | msgs | sessions | name | date | date-desc
+--sort KEY        date-desc (default) | date | cost | rep | est | tokens | speed | msgs | sessions | name
 --no-color        disable ANSI (also automatic when piped, or via NO_COLOR=1)
 --width N         force table width (default: terminal width, 110 fallback)
 ```

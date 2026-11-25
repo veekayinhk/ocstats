@@ -36,7 +36,7 @@
 set -euo pipefail
 
 PROG="ocstats"
-VERSION="1.2.2"
+VERSION="1.2.3"
 DB="${OCSTATS_DB:-$HOME/.local/share/opencode/opencode.db}"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ocstats"
 CACHE_FILE="$CACHE_DIR/api.json"
@@ -364,7 +364,9 @@ dump_rows() { # dump_rows <lo_ms> <hi_ms> → TSV assistant rows, ts-ordered
                COALESCE(json_extract(sm.data,'\$.tokens.reasoning'),0),
                COALESCE(json_extract(sm.data,'\$.tokens.cache.read'),0),
                COALESCE(json_extract(sm.data,'\$.tokens.cache.write'),0),
-               COALESCE(json_extract(sm.data,'\$.cost'),0)
+               COALESCE(json_extract(sm.data,'\$.cost'),0),
+               COALESCE(json_extract(sm.data,'\$.time.firstToken'),sm.time_created),
+               COALESCE(json_extract(sm.data,'\$.time.streamed'),0)
         FROM session_message sm
         $join_type session_v2 sv ON sv.id = sm.session_id
         WHERE $(dump_where "$1" "$2")
@@ -496,10 +498,13 @@ function dimv(d,  v) {
 }
 # ---- rates ----
 $1 == "R" { PIN[$2]=$3+0; POUT[$2]=$4+0; PCR[$2]=$5+0; PCW[$2]=$6+0; next }
-# ---- assistant usage rows: U ts prov model agent session dir in out reason cr cw cost ----
+# ---- assistant usage rows: U ts prov model agent session dir in out reason cr cw cost firstToken streamed ----
 $1 == "U" {
     ts=$2+0; prov=$3; mdl=$4; agt=$5; sid=$6; dir=$7
     tin=$8+0; tout=$9+0; treas=$10+0; tcr=$11+0; tcw=$12+0; rep=$13+0
+    ft=$14+0; streamed=$15+0
+    gen_ms = (streamed > ft ? streamed - ft : 0)
+    gen_tok = (gen_ms > 0 ? tout + treas : 0)
 
     n = split(dir, pa, "/"); proj = (dir == "" ? "(none)" : pa[n])
     d0 = daystr(ts); split(d0, da, "-"); mo = da[1] "-" da[2]; wk = monday_of(d0)
@@ -515,12 +520,14 @@ $1 == "U" {
 
     N[gk]++; IN[gk]+=tin; OUT[gk]+=tout; REAS[gk]+=treas; CR[gk]+=tcr; CW[gk]+=tcw
     REP[gk]+=rep; EST[gk]+=est; EFF[gk]+=eff; TOK[gk] = TOK[gk] " " tot
+    GTOK[gk]+=gen_tok; GMS[gk]+=gen_ms
     if (!(SESSG[gk SUBSEP sid]++)) SESSN[gk]++
     if (!(gk in FIRST) || ts < FIRST[gk]) FIRST[gk]=ts
     if (!(gk in LAST) || ts > LAST[gk]) LAST[gk]=ts
 
     TN++; TIN+=tin; TOUT+=tout; TREAS+=treas; TCR+=tcr; TCW+=tcw
     TREP+=rep; TEST_+=est; TEFF+=eff
+    TGTOK+=gen_tok; TGMS+=gen_ms
     TSID[sid]=1
     # per-session assistant timeline for prompt attribution
     STS[sid] = STS[sid] " " ts
@@ -564,17 +571,19 @@ END {
         ntk = split(TOK[k], tk, " ")
         sort_nums(tk, ntk)
         tsum = 0; for (i = 1; i <= ntk; i++) tsum += tk[i]
-        printf "%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%.6f\t%.6f\t%.6f\t%d\t%d\t%.1f\t%.1f\t%.1f\t%d\n", \
+        printf "%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%.6f\t%.6f\t%.6f\t%d\t%d\t%.1f\t%.1f\t%.1f\t%d\t%d\t%d\n", \
                line, N[k], PROM[k]+0, SESSN[k], IN[k], OUT[k], REAS[k], CR[k], CW[k], \
                REP[k], EST[k], EFF[k], FIRST[k], LAST[k], \
-               (ntk ? tsum/ntk : 0), pctile(tk, ntk, 50), pctile(tk, ntk, 90), tsum
+               (ntk ? tsum/ntk : 0), pctile(tk, ntk, 50), pctile(tk, ntk, 90), tsum, \
+               GTOK[k]+0, GMS[k]+0
     }
     tnsess = 0; for (s in TSID) tnsess++
     print "##TOTAL"
     totpfx = ""
     for (i = 1; i <= nd; i++) totpfx = totpfx "\t"
-    printf "%s%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%.6f\t%.6f\t%.6f\t0\t0\t0\t0\t0\t0\n", \
-           totpfx, TN, matched_p, tnsess, TIN, TOUT, TREAS, TCR, TCW, TREP, TEST_, TEFF
+    printf "%s%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%.6f\t%.6f\t%.6f\t0\t0\t0\t0\t0\t%d\t%d\t%d\n", \
+           totpfx, TN, matched_p, tnsess, TIN, TOUT, TREAS, TCR, TCW, TREP, TEST_, TEFF, \
+           TIN+TOUT+TREAS+TCR+TCW, TGTOK+0, TGMS+0
 }'
 
 aggregate() { # aggregate <dims csv> <lo_ms> <hi_ms> → group rows (##TOTAL last)
@@ -616,7 +625,8 @@ function hmm(ms,  d, rem, hh, mi) {
     if (rem < 0) rem += 86400000
     hh = int(rem / 3600000); mi = int((rem % 3600000) / 60000)
     return substr(d, 6) " " sprintf("%02d:%02d", hh, mi) }
-function hitpct(cr, tin, cw) { return (cr + tin + cw > 0) ? sprintf("%.1f%%", cr / (cr + tin + cw) * 100) : "0.0%" }'
+function hitpct(cr, tin, cw) { return (cr + tin + cw > 0) ? sprintf("%.1f%%", cr / (cr + tin + cw) * 100) : "0.0%" }
+function tps(tok, ms) { return (ms > 0) ? sprintf("%.1f", tok / (ms / 1000)) : "—" }'
 
 group_report() { # group_report <title> <dims csv> [lo hi]
     local title="$1" dims_csv="$2" glo="${3:-$LO_MS}" ghi="${4:-$HI_MS}"
@@ -632,12 +642,15 @@ group_report() { # group_report <title> <dims csv> [lo hi]
     total=$(awk '/^##TOTAL$/{getline; print}' <<<"$raw")
     raw=$(awk '/^##TOTAL$/{exit} {print}' <<<"$raw")
 
-    # raw cols: dims(1..nd) n prompts sessions in out reason cr cw rep est eff first last mean med p90 toktot
+    # raw cols: dims(1..nd) n prompts sessions in out reason cr cw rep est eff first last mean med p90 toktot gen_tok gen_ms
     local e=$((ndim + 11))   # eff column
-    local tcol=$((ndim + 18)) # tok_total column
+    local tcol=$((ndim + 17)) # tok_total column
+    local gtokcol=$((ndim + 18)) # generation tokens (output+reasoning)
+    local gmscol=$((ndim + 19))  # generation milliseconds (streamed window)
     case "$SORT" in
         cost|eff) raw=$(sort -t$'\t' -k"$e,$e"gr <<<"$raw") ;;
         tokens)  raw=$(awk -F'\t' -v c="$tcol" '{ print $c "\t" $0 }' <<<"$raw" | sort -t$'\t' -k1,1gr | cut -f2-) ;;
+        speed)   raw=$(awk -F'\t' -v t="$gtokcol" -v m="$gmscol" '{ print (($m > 0) ? $t / ($m / 1000) : 0) "\t" $0 }' <<<"$raw" | sort -t$'\t' -k1,1gr | cut -f2-) ;;
         name)    raw=$(sort -t$'\t' <<<"$raw") ;;
         date)    raw=$(sort -t$'\t' -k$((ndim+12)),$((ndim+12))n <<<"$raw") ;;
         msgs)    raw=$(sort -t$'\t' -k$((ndim+1)),$((ndim+1))gr <<<"$raw") ;;
@@ -700,12 +713,12 @@ group_report() { # group_report <title> <dims csv> [lo hi]
             cache) hdr+=("Cache hits");; *) hdr+=("$METRIC");;
         esac
     else
-        hdr+=("Msgs" "Sessions" "Tok in" "Tok out" "Cache R" "Cache hit" "Rep \$" "Est \$" "Σ \$" "Share")
+        hdr+=("Msgs" "Sessions" "Tok in" "Tok out" "Tokens" "Cache R" "Cache hit" "Tok/s" "Rep \$" "Est \$" "Σ \$" "Share")
         ((DETAILS)) && hdr+=("Prompts" "Reasoning" "Cache W" "Mean" "Median" "p90" "First seen" "Last seen")
     fi
     [[ -n "$prev_map_file" ]] && hdr+=("Prev Σ \$" "Δ Σ \$" "Δ msgs")
 
-    local aligns; aligns="$(printf 'l%.0s' $(seq 1 "$ndim"))rrrrrrrrrr"
+    local aligns; aligns="$(printf 'l%.0s' $(seq 1 "$ndim"))rrrrrrrrrrrr"
     ((DETAILS)) && aligns+="rrrrrrrr"
     [[ -n "$prev_map_file" ]] && aligns+="rrr"
 
@@ -730,14 +743,15 @@ group_report() { # group_report <title> <dims csv> [lo hi]
                     else if (metric == "in") line = line "\t" commas(tin)
                     else if (metric == "out") line = line "\t" commas($(nd+5))
                     else if (metric == "cache") line = line "\t" commas(cr)
-                    else line = line "\t" commas($(nd+18))
+                    else line = line "\t" commas($(nd+17))
                     print line; next
                 }
                 repc = (rep == 0 ? D money(rep) : Y money(rep))
                 estc = (est == 0 && rep == 0 ? D "—" : G money(est))
                 share = (teff > 0 ? sprintf("%.1f%%", eff / teff * 100) : "0.0%")
                 line = line "\t" commas($(nd+1)) "\t" commas($(nd+3)) "\t" commas(tin) "\t" \
-                       commas($(nd+5)) "\t" commas(cr) "\t" hitpct(cr, tin, $(nd+8)) "\t" repc "\t" estc "\t" \
+                       commas($(nd+5)) "\t" commas($(nd+17)) "\t" commas(cr) "\t" \
+                       hitpct(cr, tin, $(nd+8)) "\t" tps($(nd+18), $(nd+19)) "\t" repc "\t" estc "\t" \
                        B W money(eff) R "\t" share
                 if (details == "1") {
                     line = line "\t" commas($(nd+2)) "\t" commas($(nd+6)) "\t" commas($(nd+8)) "\t" \
@@ -757,7 +771,7 @@ group_report() { # group_report <title> <dims csv> [lo hi]
         if ((restn > 0)); then
             local pvextra=0
             [[ -n "$prev_map_file" ]] && pvextra=3
-            local padcols=$(( 9 + ndim - 1 + DETAILS * 8 + pvextra ))
+            local padcols=$(( ndim + 11 + DETAILS * 8 + pvextra ))
             printf '%s' "${DIM}+ $restn more"
             printf '%s' "$(printf '\t%.0s' $(seq 1 "$padcols"))"
             printf '%s\n' "$RESET"
@@ -770,12 +784,13 @@ group_report() { # group_report <title> <dims csv> [lo hi]
                 names = "TOTAL"
                 for (i = 2; i <= nd; i++) names = names "\t"
                 print names "\t" B commas($(nd+1)) R "\t" B commas($(nd+3)) R "\t" \
-                      B commas(tin) R "\t" B commas($(nd+5)) R "\t" B commas(cr) R "\t" \
-                      B hitpct(cr, tin, $(nd+8)) R "\t" B Y money($(nd+9)) R "\t" \
+                      B commas(tin) R "\t" B commas($(nd+5)) R "\t" B commas($(nd+17)) R "\t" \
+                      B commas(cr) R "\t" B hitpct(cr, tin, $(nd+8)) R "\t" \
+                      B tps($(nd+18), $(nd+19)) R "\t" B Y money($(nd+9)) R "\t" \
                       B G money($(nd+10)) R "\t" B W money($(nd+11)) R "\t" B "100%" R
             }' <<<"$total"
     } | render_tsv "$title" "$aligns" 1 \
-       "$(printf 'Σ = reported where > 0, else estimated · — = no pricing data available%s' \
+       "$(printf 'Σ = reported where > 0, else estimated · — = no pricing data available · Tok/s = (output+reasoning) ÷ streamed time%s' \
           "$([[ $hidden -gt 0 ]] && printf ' · %d group(s) below %s%% share hidden' "$hidden" "$MINSHARE")")"
     [[ -n "$prev_map_file" ]] && rm -f "$prev_map_file"
     echo
@@ -786,13 +801,14 @@ csv_group() { # csv_group <dims csv> <raw rows> → CSV with raw numbers
     ndim=$(awk -F, '{print NF}' <<<"$dims_csv")
     local -a dimarr=(); IFS=',' read -r -a dimarr <<<"$dims_csv"
     {
-        printf '%s\n' "$(IFS=','; echo "${dimarr[*]}"),n,prompts,sessions,in,out,reason,cr,cw,cost_rep,cost_est,cost_eff,first_ts,last_ts,tok_mean,tok_median,tok_p90,tok_total"
+        printf '%s\n' "$(IFS=','; echo "${dimarr[*]}"),n,prompts,sessions,in,out,reason,cr,cw,cost_rep,cost_est,cost_eff,first_ts,last_ts,tok_mean,tok_median,tok_p90,tok_total,tok_per_sec"
         awk -F'\t' -v nd="$ndim" '
             function cq(s) { gsub(/"/, "\"\"", s); return "\"" s "\"" }
             {
                 out = ""
                 for (i = 1; i <= nd; i++) out = out (i > 1 ? "," : "") cq($i)
-                for (i = nd + 1; i <= nd + 18; i++) out = out "," $(i)
+                for (i = nd + 1; i <= nd + 17; i++) out = out "," $(i)
+                out = out "," sprintf("%.6f", ($(nd+19) > 0 ? $(nd+18) / ($(nd+19) / 1000) : 0))
                 print out
             }' <<<"$raw"
     }
@@ -813,8 +829,10 @@ json_group() { # json_group <dims csv> <limited raw rows>
                    $(nd+4), $(nd+5), $(nd+6), $(nd+7), $(nd+8)
             printf ", \"cost_rep\": %s, \"cost_est\": %s, \"cost_eff\": %s", $(nd+9), $(nd+10), $(nd+11)
             printf ", \"first_ts\": %s, \"last_ts\": %s", $(nd+12), $(nd+13)
-            printf ", \"tok_mean\": %s, \"tok_median\": %s, \"tok_p90\": %s, \"tok_total\": %s}", \
+            printf ", \"tok_mean\": %s, \"tok_median\": %s, \"tok_p90\": %s, \"tok_total\": %s", \
                    $(nd+14), $(nd+15), $(nd+16), $(nd+17)
+            printf ", \"tok_per_sec\": %s}", \
+                   ($(nd+19) > 0 ? $(nd+18) / ($(nd+19) / 1000) : 0)
         } END { print "]}" }' | jq .
 }
 
@@ -1790,7 +1808,7 @@ while [[ $# -gt 0 ]]; do
             echo "commands: $COMMANDS"
             echo "filters: --since --until --model --provider --agent --project --session"
             echo "output:  --json --csv --md --details --limit N --top N --bottom N --min-share P"
-            echo "         --sort cost|rep|est|tokens|msgs|sessions|name|date|date-desc --no-color"
+            echo "         --sort cost|rep|est|tokens|speed|msgs|sessions|name|date|date-desc --no-color"
             echo "matrix:  --by provider,model,day,week,month,hour,dow,agent,project,session --metric M"
             echo "pivot:   --rows DIM --cols DIM --metric tokens|in|out|cache|msgs|prompts|cost"
             echo "heatmap: [--by DIM] [--split] [--weeks N] [--metric M]  (alias: calendar)"

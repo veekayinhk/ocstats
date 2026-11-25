@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	version      = "1.2.2"
+	version      = "1.2.3"
 	prog         = "ocstats"
 	modelsDevURL = "https://models.dev/api.json"
 )
@@ -89,6 +89,8 @@ type Row struct {
 	CacheR    int64
 	CacheW    int64
 	Cost      float64 // reported
+	GenTok    int64   // output + reasoning tokens with valid streaming timestamps
+	GenMS     int64   // streaming window in milliseconds
 }
 
 type Prompt struct {
@@ -113,8 +115,17 @@ type Group struct {
 	Rep, Est   float64
 	Eff        float64
 	Tokens     []int64
+	GenTok     int64
+	GenMS      int64
 	FirstTS    time.Time
 	LastTS     time.Time
+}
+
+func (g *Group) TPS() float64 {
+	if g.GenMS <= 0 {
+		return 0
+	}
+	return float64(g.GenTok) / (float64(g.GenMS) / 1000)
 }
 
 func (g *Group) CacheHit() float64 {
@@ -320,7 +331,9 @@ SELECT sm.session_id,
        COALESCE(json_extract(sm.data, '$.tokens.reasoning'), 0),
        COALESCE(json_extract(sm.data, '$.tokens.cache.read'), 0),
        COALESCE(json_extract(sm.data, '$.tokens.cache.write'), 0),
-       COALESCE(json_extract(sm.data, '$.cost'), 0.0)
+       COALESCE(json_extract(sm.data, '$.cost'), 0.0),
+       COALESCE(json_extract(sm.data, '$.time.firstToken'), sm.time_created),
+       COALESCE(json_extract(sm.data, '$.time.streamed'), 0)
 FROM session_message AS sm
 WHERE ` + where + `
 ORDER BY sm.time_created`
@@ -339,8 +352,9 @@ ORDER BY sm.time_created`
 	for rows.Next() {
 		var sid, prov, mdl, agt string
 		var ts, inT, outT, reasT, crT, cwT int64
+		var firstToken, streamed int64
 		var cost float64
-		if err := rows.Scan(&sid, &ts, &prov, &mdl, &agt, &inT, &outT, &reasT, &crT, &cwT, &cost); err != nil {
+		if err := rows.Scan(&sid, &ts, &prov, &mdl, &agt, &inT, &outT, &reasT, &crT, &cwT, &cost, &firstToken, &streamed); err != nil {
 			return nil, err
 		}
 		if prov == "" {
@@ -372,6 +386,14 @@ ORDER BY sm.time_created`
 			continue
 		}
 		t := time.UnixMilli(ts)
+		genMS := int64(0)
+		if streamed > firstToken {
+			genMS = streamed - firstToken
+		}
+		genTok := int64(0)
+		if genMS > 0 {
+			genTok = outT + reasT
+		}
 		out = append(out, Row{
 			TS:        t,
 			Day:       t.Format("2006-01-02"),
@@ -391,6 +413,8 @@ ORDER BY sm.time_created`
 			CacheR:    crT,
 			CacheW:    cwT,
 			Cost:      cost,
+			GenTok:    genTok,
+			GenMS:     genMS,
 		})
 	}
 	return out, rows.Err()
@@ -733,6 +757,8 @@ func groupRows(rows []Row, dims []string, p *pricing, prompts []Prompt) []*Group
 		g.Reason += r.Reason
 		g.CR += r.CacheR
 		g.CW += r.CacheW
+		g.GenTok += r.GenTok
+		g.GenMS += r.GenMS
 		g.Rep += r.Cost
 		est := p.Estimate(r)
 		g.Est += est
@@ -786,6 +812,8 @@ func sortGroups(gs []*Group, by string) {
 		less = func(a, b *Group) bool { return a.Est > b.Est }
 	case "tokens":
 		less = func(a, b *Group) bool { return tokenSum(a) > tokenSum(b) }
+	case "speed":
+		less = func(a, b *Group) bool { return a.TPS() > b.TPS() }
 	case "msgs":
 		less = func(a, b *Group) bool { return a.N > b.N }
 	case "sessions":
@@ -845,6 +873,13 @@ func tok(n int64) string {
 }
 
 func pct(v float64) string { return fmt.Sprintf("%.1f%%", v*100) }
+
+func tpsCell(g *Group) string {
+	if g.GenMS <= 0 {
+		return dim("—")
+	}
+	return fmt.Sprintf("%.1f", g.TPS())
+}
 
 func bar(frac float64, width int) string {
 	if frac < 0 {
@@ -1225,7 +1260,7 @@ dimensions for matrix --by / pivot --rows / --cols / heatmap --by / chart --by:
 
 filters: --since --until (YYYY-MM-DD | 30d)  --model --provider --agent --project --session
 output:  --json --csv --md --details --limit N --top N --bottom N --min-share P
-         --sort cost|rep|est|tokens|msgs|sessions|name|date|date-desc --no-color --width N
+         --sort cost|rep|est|tokens|speed|msgs|sessions|name|date|date-desc --no-color --width N
 extra:   --monthly-budget AMOUNT --compare CUR/PREV (e.g. 7d/7d) --refresh
 `, prog)
 }
@@ -1801,6 +1836,7 @@ func groupReport(w io.Writer, rows []Row, flt *Filters, p *pricing, o *options, 
 			r["tok_mean"] = round6(g.Mean())
 			r["tok_median"] = round6(g.Median())
 			r["tok_p90"] = round6(g.P90())
+			r["tok_per_sec"] = round6(g.TPS())
 			out = append(out, r)
 		}
 		b, _ := json.MarshalIndent(map[string]any{"rows": out}, "", "  ")
@@ -1809,7 +1845,7 @@ func groupReport(w io.Writer, rows []Row, flt *Filters, p *pricing, o *options, 
 	}
 	if o.csvOut {
 		fmt.Fprint(w, strings.Join(dims, ","))
-		fmt.Fprintln(w, ",n,prompts,sessions,in,out,reason,cr,cw,cost_rep,cost_est,cost_eff,first_ts,last_ts,tok_mean,tok_median,tok_p90,tok_total")
+		fmt.Fprintln(w, ",n,prompts,sessions,in,out,reason,cr,cw,cost_rep,cost_est,cost_eff,first_ts,last_ts,tok_mean,tok_median,tok_p90,tok_total,tok_per_sec")
 		for _, g := range gs {
 			vals := []string{}
 			for _, gk := range g.Key {
@@ -1823,7 +1859,8 @@ func groupReport(w io.Writer, rows []Row, flt *Filters, p *pricing, o *options, 
 				fmt.Sprintf("%.6f", g.Rep), fmt.Sprintf("%.6f", g.Est), fmt.Sprintf("%.6f", g.Eff),
 				strconv.FormatInt(g.FirstTS.UnixMilli(), 10), strconv.FormatInt(g.LastTS.UnixMilli(), 10),
 				fmt.Sprintf("%.1f", g.Mean()), fmt.Sprintf("%.1f", g.Median()),
-				fmt.Sprintf("%.1f", g.P90()), strconv.FormatInt(tokenSum(g), 10))
+				fmt.Sprintf("%.1f", g.P90()), strconv.FormatInt(tokenSum(g), 10),
+				fmt.Sprintf("%.6f", g.TPS()))
 			fmt.Fprintln(w, strings.Join(vals, ","))
 		}
 		return nil
@@ -1861,8 +1898,8 @@ func groupReport(w io.Writer, rows []Row, flt *Filters, p *pricing, o *options, 
 			frow = func(g *Group) string { return tok(tokenSum(g)) }
 		}
 	} else {
-		headers = append(headers, "Msgs", "Sessions", "Tok in", "Tok out", "Cache R",
-			"Cache hit", "Rep $", "Est $", "Σ $", "Share")
+		headers = append(headers, "Msgs", "Sessions", "Tok in", "Tok out", "Tokens",
+			"Cache R", "Cache hit", "Tok/s", "Rep $", "Est $", "Σ $", "Share")
 		if o.details {
 			headers = append(headers, "Prompts", "Reasoning", "Cache W", "Mean",
 				"Median", "p90", "First seen", "Last seen")
@@ -1870,7 +1907,7 @@ func groupReport(w io.Writer, rows []Row, flt *Filters, p *pricing, o *options, 
 	}
 	aligns := strings.Repeat("l", len(dims)) + "r"
 	if !focus {
-		aligns += "rrrrrrrrr"
+		aligns += "rrrrrrrrrrrr"
 		if o.details {
 			aligns += "rrrrrrrr"
 		}
@@ -1904,8 +1941,8 @@ func groupReport(w io.Writer, rows []Row, flt *Filters, p *pricing, o *options, 
 				share = g.Eff / totalEff
 			}
 			row = append(row, tok(int64(g.N)), tok(int64(len(g.Sessions))), tok(g.In),
-				tok(g.Out), tok(g.CR), pct(g.CacheHit()), repC, estC,
-				bold(white(money(g.Eff))), pct(share))
+				tok(g.Out), tok(tokenSum(g)), tok(g.CR), pct(g.CacheHit()), tpsCell(g),
+				repC, estC, bold(white(money(g.Eff))), pct(share))
 			if o.details {
 				row = append(row, tok(int64(g.Prompts)), tok(g.Reason), tok(g.CW),
 					tok(int64(math.Round(g.Mean()))), tok(int64(math.Round(g.Median()))),
@@ -1932,6 +1969,7 @@ func groupReport(w io.Writer, rows []Row, flt *Filters, p *pricing, o *options, 
 			make([]string, len(headers)-1)...))
 	}
 	var tIn, tOut, tCR, tTok int64
+	var tGenTok, tGenMS int64
 	var tRep, tEst, tEff float64
 	var tN, tP int
 	for _, g := range gs {
@@ -1941,9 +1979,19 @@ func groupReport(w io.Writer, rows []Row, flt *Filters, p *pricing, o *options, 
 		tOut += g.Out
 		tCR += g.CR
 		tTok += tokenSum(g)
+		tGenTok += g.GenTok
+		tGenMS += g.GenMS
 		tRep += g.Rep
 		tEst += g.Est
 		tEff += g.Eff
+	}
+	tTps := 0.0
+	if tGenMS > 0 {
+		tTps = float64(tGenTok) / (float64(tGenMS) / 1000)
+	}
+	tpsFooter := "—"
+	if tTps > 0 {
+		tpsFooter = fmt.Sprintf("%.1f", tTps)
 	}
 	var footerCells []string
 	if focus {
@@ -1966,8 +2014,9 @@ func groupReport(w io.Writer, rows []Row, flt *Filters, p *pricing, o *options, 
 			bold(white(fallback)))
 	} else {
 		footerCells = append(append([]string{"TOTAL"}, make([]string, len(dims)-1)...),
-			tok(int64(tN)), tok(int64(len(totalSessions))), tok(tIn), tok(tOut), tok(tCR),
-			pct(cacheRatio(tCR, tIn, 0)), bold(yellow(money(tRep))), bold(green(money(tEst))),
+			tok(int64(tN)), tok(int64(len(totalSessions))), tok(tIn), tok(tOut), tok(tTok),
+			tok(tCR), pct(cacheRatio(tCR, tIn, 0)), tpsFooter,
+			bold(yellow(money(tRep))), bold(green(money(tEst))),
 			bold(white(money(tEff))), bold("100%"))
 		if o.details {
 			footerCells = append(footerCells, "", "", "", "", "", "", "", "")
@@ -1976,7 +2025,7 @@ func groupReport(w io.Writer, rows []Row, flt *Filters, p *pricing, o *options, 
 			footerCells = append(footerCells, "", "", "")
 		}
 	}
-	note := "Σ = reported where > 0, else estimated · — = no pricing data available"
+	note := "Σ = reported where > 0, else estimated · — = no pricing data available · Tok/s = (output+reasoning) ÷ streamed time"
 	if o.minShare > 0 {
 		note += fmt.Sprintf(" · %d group(s) below %g%% share hidden", hidden, o.minShare)
 	}
@@ -2016,7 +2065,8 @@ func cmdSessions(w io.Writer, rows []Row, flt *Filters, p *pricing, o *options) 
 		for _, g := range gs {
 			r := jrow{"session": g.Key[0], "project": project[g.Key[0]], "n": g.N,
 				"prompts": g.Prompts, "sessions": len(g.Sessions),
-				"tokens":   tokenSum(g), "cost_rep": round6(g.Rep),
+				"tokens": tokenSum(g), "tok_per_sec": round6(g.TPS()),
+				"cost_rep": round6(g.Rep),
 				"cost_est": round6(g.Est), "cost_eff": round6(g.Eff)}
 			out = append(out, r)
 		}
@@ -2025,11 +2075,11 @@ func cmdSessions(w io.Writer, rows []Row, flt *Filters, p *pricing, o *options) 
 		return nil
 	}
 	if o.csvOut {
-		fmt.Fprintln(w, "session,project,n,prompts,sessions,tokens,cost_rep,cost_est,cost_eff")
+		fmt.Fprintln(w, "session,project,n,prompts,sessions,tokens,tok_per_sec,cost_rep,cost_est,cost_eff")
 		for _, g := range gs {
-			fmt.Fprintf(w, "%s,%s,%d,%d,%d,%d,%.6f,%.6f,%.6f\n",
+			fmt.Fprintf(w, "%s,%s,%d,%d,%d,%d,%.6f,%.6f,%.6f,%.6f\n",
 				csvQuote(g.Key[0]), csvQuote(project[g.Key[0]]), g.N, g.Prompts,
-				len(g.Sessions), tokenSum(g), g.Rep, g.Est, g.Eff)
+				len(g.Sessions), tokenSum(g), g.TPS(), g.Rep, g.Est, g.Eff)
 		}
 		return nil
 	}
@@ -2049,25 +2099,31 @@ func cmdSessions(w io.Writer, rows []Row, flt *Filters, p *pricing, o *options) 
 			share = g.Eff / totalEff
 		}
 		rrows = append(rrows, []string{dim(sid), truncate(project[g.Key[0]], 36),
-			tok(int64(g.N)), tok(int64(g.Prompts)), tok(tokenSum(g)), repC, estC,
-			bold(white(money(g.Eff))), pct(share)})
+			tok(int64(g.N)), tok(int64(g.Prompts)), tok(tokenSum(g)), tpsCell(g),
+			repC, estC, bold(white(money(g.Eff))), pct(share)})
 	}
 	var tRep, tEff float64
 	var tN, tP int
-	var tToks int64
+	var tToks, tGenTok, tGenMS int64
 	for _, g := range gs {
 		tN += g.N
 		tP += g.Prompts
 		tToks += tokenSum(g)
+		tGenTok += g.GenTok
+		tGenMS += g.GenMS
 		tRep += g.Rep
 		tEff += g.Eff
 	}
+	tpsFooter := "—"
+	if tGenMS > 0 {
+		tpsFooter = fmt.Sprintf("%.1f", float64(tGenTok)/(float64(tGenMS)/1000))
+	}
 	renderTable(w, "Sessions",
-		[]string{"Session", "Project", "Msgs", "Prompts", "Tokens",
-			"Rep $", "Est $", "Σ $", "Share"}, "llrrrrrrr",
-		rrows, [][]string{{"TOTAL", "", tok(int64(tN)), tok(int64(tP)), tok(tToks),
+		[]string{"Session", "Project", "Msgs", "Prompts", "Tokens", "Tok/s",
+			"Rep $", "Est $", "Σ $", "Share"}, "llrrrrrrrr",
+		rrows, [][]string{{"TOTAL", "", tok(int64(tN)), tok(int64(tP)), tok(tToks), tpsFooter,
 			bold(yellow(money(tRep))), "", bold(white(money(tEff))), ""}},
-		fmt.Sprintf("top %d sessions · Σ = reported where > 0, else estimated", len(gs)))
+		fmt.Sprintf("top %d sessions · Σ = reported where > 0, else estimated · Tok/s = (output+reasoning) ÷ streamed time", len(gs)))
 	fmt.Println()
 	return nil
 }

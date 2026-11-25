@@ -86,6 +86,31 @@ msg_n=$(extract "$py_tot" '.totals.messages')
 [[ "$mdl_sum" == "$msg_n" ]] && ok "models msgs Σ $mdl_sum == summary msgs $msg_n" \
                           || bad "models Σ $mdl_sum != summary $msg_n"
 
+# daily Tokens column reconciles with summary total in all implementations
+tok_total=$(extract "$py_tot" '.totals.tokens.total')
+day_py=$("$PY" daily --json --since "$SINCE" --limit 0 | jq '[.rows[].tok_total] | add')
+day_sh=$("$SH" daily --json --since "$SINCE" --limit 0 | jq '[.rows[].tok_total] | add')
+[[ "$day_py" == "$tok_total" ]] && ok "python daily tokens Σ $day_py == summary $tok_total" \
+                              || bad "python daily tokens Σ $day_py != summary $tok_total"
+[[ "$day_sh" == "$tok_total" ]] && ok "bash daily tokens Σ $day_sh == summary $tok_total" \
+                              || bad "bash daily tokens Σ $day_sh != summary $tok_total"
+"$PY" daily --since "$SINCE" --no-color | grep -c 'Tokens' >/dev/null \
+    && ok "python daily shows Tokens column" || bad "python daily missing Tokens column"
+"$SH" daily --since "$SINCE" --no-color | grep -c 'Tokens' >/dev/null \
+    && ok "bash daily shows Tokens column" || bad "bash daily missing Tokens column"
+
+# tok/s is exposed and consistent across implementations
+sp_py=$("$PY" models --json --since "$SINCE" --limit 0 \
+        | jq -r '[.rows[] | select(.model == "acme-pro")][0].tok_per_sec')
+sp_sh=$("$SH" models --json --since "$SINCE" --limit 0 \
+        | jq -r '[.rows[] | select(.model == "acme-pro")][0].tok_per_sec')
+if awk -v a="$sp_py" -v b="$sp_sh" \
+    'BEGIN{ d = a - b; if (d < 0) d = -d; exit !(a > 0 && d <= a * 0.001) }'; then
+    ok "models tok/s ≈ $sp_py (python == bash)"
+else
+    bad "models tok/s: python=$sp_py bash=$sp_sh"
+fi
+
 # --- bash json validity ------------------------------------------------------
 echo "bash json validity:"
 for cmd in "models" "providers" "daily" "matrix --by provider,month"; do
@@ -218,6 +243,17 @@ if [[ -x "$GO_BIN" ]]; then
         c=$(extract "$go_tot" "$field")
         [[ "$a" == "$c" ]] && ok "$field = $a" || bad "$field: python=$a go=$c"
     done
+    go_day=$("$GO_BIN" daily --json --since "$SINCE" --limit 0 | jq '[.rows[].tok_total] | add')
+    [[ "$go_day" == "$tok_total" ]] && ok "go daily tokens Σ $go_day == summary $tok_total" \
+                                   || bad "go daily tokens Σ $go_day != summary $tok_total"
+    sp_go=$("$GO_BIN" models --json --since "$SINCE" --limit 0 \
+            | jq -r '[.rows[] | select(.model == "acme-pro")][0].tok_per_sec')
+    if awk -v a="$sp_py" -v b="$sp_go" \
+        'BEGIN{ d = a - b; if (d < 0) d = -d; exit !(a > 0 && d <= a * 0.001) }'; then
+        ok "models tok/s ≈ $sp_py (python == go)"
+    else
+        bad "models tok/s: python=$sp_py go=$sp_go"
+    fi
 else
     echo "go binary: skipped (not built — run: make build)"
 fi

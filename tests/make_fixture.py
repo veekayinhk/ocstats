@@ -108,6 +108,12 @@ def make_db(path: str) -> dict:
                 if pin or pout:  # paid model → reported cost from fixed rates
                     cost = round((tin * pin + tout * pout + tcr * pcr) / 1_000_000, 6)
                     stats["cost"] += cost
+                # deterministic streaming timestamps for tok/s (output+reasoning)
+                gen_speed = rng.choice([25, 40, 60, 80])
+                gen_ms = max(200, int((tout + treas) / gen_speed * 1000))
+                first_token = a_ts + rng.randrange(150, 600)
+                streamed = first_token + gen_ms
+                completed = streamed + rng.randrange(50, 1_500)
                 conn.execute(
                     "INSERT INTO session_message VALUES (?,?,?,?,?,?)",
                     (f"msg_{sid}_{seq}_a", sid, "assistant", seq, a_ts, json.dumps({
@@ -116,6 +122,8 @@ def make_db(path: str) -> dict:
                         "tokens": {"input": tin, "output": tout, "reasoning": treas,
                                    "cache": {"read": tcr, "write": tcw}},
                         "cost": cost,
+                        "time": {"created": a_ts, "firstToken": first_token,
+                                 "streamed": streamed, "completed": completed},
                     })))
                 seq += 1
                 stats["assistant"] += 1

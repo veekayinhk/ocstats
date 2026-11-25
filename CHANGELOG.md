@@ -3,6 +3,25 @@
 All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.2.3] - 2026-11-25
+
+### Added
+- **Total token column**: `daily`, `weekly`, `monthly` and every group table
+  (`models`, `providers`, `agents`, `projects`, `sessions`, `matrix`, …) now
+  show a **Tokens** column alongside the input/output/cache breakdown.
+- **Speed (Tok/s)**: group tables now show output + reasoning tokens divided by
+  the model's streaming window (`time.firstToken` → `time.streamed`) — the
+  same definition OpenCode uses. Rows without streaming timestamps render
+  `—` but still count toward token and cost totals.
+- `--sort speed` for any group table, and a `tok_per_sec` field in `--json` /
+  `--csv` output across Python, Bash and Go.
+- The synthetic fixture now emits streaming timestamps, and the test suite
+  checks daily token reconciliation plus cross-implementation Tok/s parity.
+
+### Fixed
+- Bash `--sort tokens` and the focused token metric read the correct raw
+  column (off-by-one), and CSV output no longer appends an empty field.
+
 ## [1.2.2] - 2026-11-15
 
 ### Changed
